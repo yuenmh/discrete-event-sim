@@ -10,4 +10,5 @@ dependencies = [
 
 [tool.pyright]
 typeCheckingMode = "standard"
+reportUnusedFunction = false
 

@@ -1,6 +1,7 @@
 import inspect
+import types
 from dataclasses import dataclass, field, replace
-from typing import Any, Protocol
+from typing import Any, Coroutine, Generator, Protocol
 from uuid import UUID, uuid4
 
 from frozendict import frozendict
@@ -31,20 +32,94 @@ class Ctx:
     def send(self, addr: Addr, *args: Any, **kwargs: Any) -> None:
         self.sent_messages.append((addr, RawMessage(args, frozendict(kwargs))))
 
+    @types.coroutine
+    def wait(
+        self, *args: Any, **kwargs: Any
+    ) -> Generator[CoBranchYield, RawMessage, tuple[Any, ...]]:
+        msg = yield CoBranchYield(args, kwargs)
+        return *msg.args, msg.kwargs
+
 
 class TransitionFn(Protocol):
+    def __call__(self, ctx: Ctx, msg: RawMessage) -> "Transition": ...
+
+
+class TransitionImplFn(Protocol):
     def __call__(self, ctx: Ctx, *args: Any, **kwargs: Any) -> "Transition": ...
+
+
+def _wrap_normal_transition_fn(fn: TransitionImplFn) -> TransitionFn:
+    def wrapped(ctx: Ctx, msg: RawMessage) -> Transition:
+        return fn(ctx, *msg.args, **msg.kwargs)
+
+    return wrapped
+
+
+@dataclass
+class CoBranchYield:
+    match_args: tuple[Any, ...]
+    match_kwargs: dict[str, Any]
+
+
+class TransitionCoroutineFn(Protocol):
+    def __call__(
+        self, ctx: Ctx, *args: Any, **kwargs: Any
+    ) -> Coroutine[CoBranchYield, RawMessage | None, None]: ...
+
+
+def _wrap_coroutine_transition_fn(
+    fn: TransitionCoroutineFn, parent_transition: Transition
+) -> TransitionFn:
+    def wrapped(ctx: Ctx, msg: RawMessage) -> Transition:
+        co = fn(ctx, *msg.args, **msg.kwargs)
+        try:
+            yield_params = co.send(None)
+        except StopIteration:
+            return parent_transition
+        t = Transition()
+
+        @t.add_branch(*yield_params.match_args, **yield_params.match_kwargs)
+        def resume(ctx: Ctx, msg: RawMessage):
+            del ctx  # unused
+            try:
+                yield_params = co.send(msg)
+            except StopIteration:
+                return parent_transition
+            t.branches[0].match_args = yield_params.match_args
+            t.branches[0].match_kwargs = yield_params.match_kwargs
+            return t
+
+        return t
+
+    return wrapped
 
 
 class Transition:
     def __init__(self, branches: list[TransitionBranch] | None = None) -> None:
         self.branches = branches or []
 
-    def branch(self, *args: Any, **kwargs: Any):
-        def add_branch(fn: TransitionFn):
-            self.branches.append(TransitionBranch(args, kwargs, fn))
+    def add_branch(self, *args: Any, **kwargs: Any):
+        def decorator(fn: TransitionFn):
+            self.branches.append(
+                TransitionBranch(
+                    match_args=args,
+                    match_kwargs=kwargs,
+                    fn=fn,
+                )
+            )
 
-        return add_branch
+        return decorator
+
+    def branch(self, *args: Any, **kwargs: Any):
+        def decorator(fn: TransitionImplFn | TransitionCoroutineFn):
+            if inspect.iscoroutinefunction(fn):
+                self.add_branch(*args, **kwargs)(
+                    _wrap_coroutine_transition_fn(fn, self)
+                )
+            elif inspect.isfunction(fn):
+                self.add_branch(*args, **kwargs)(_wrap_normal_transition_fn(fn))
+
+        return decorator
 
     def find_matching_branch(self, msg: RawMessage) -> TransitionBranch | None:
         for branch in self.branches:
@@ -63,10 +138,10 @@ class Transition:
         return None
 
 
-class TransitionBranch[State]:
+class TransitionBranch:
     def __init__(
         self,
-        match_args: tuple[Any],
+        match_args: tuple[Any, ...],
         match_kwargs: dict[str, Any],
         fn: TransitionFn,
     ) -> None:
@@ -91,8 +166,8 @@ class TransitionBranch[State]:
         return self.fn(*bound.args, **bound.kwargs)
 
 
-def wait[State](*args: Any, **kwargs: Any):
-    def decorator(fn: TransitionFn):
+def wait(*args: Any, **kwargs: Any):
+    def decorator(fn: TransitionImplFn):
         t = Transition()
         t.branch(*args, **kwargs)(fn)
         return t
