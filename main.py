@@ -1,5 +1,7 @@
 import inspect
 import types
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass, field, replace
 from typing import Any, Coroutine, Generator, Protocol
 from uuid import UUID, uuid4
@@ -45,12 +47,16 @@ class TransitionFn(Protocol):
 
 
 class TransitionImplFn(Protocol):
-    def __call__(self, ctx: Ctx, *args: Any, **kwargs: Any) -> "Transition": ...
+    def __call__(self, *args: Any, **kwargs: Any) -> "Transition": ...
 
 
 def _wrap_normal_transition_fn(fn: TransitionImplFn) -> TransitionFn:
+    sig = inspect.signature(fn)
+
     def wrapped(ctx: Ctx, msg: RawMessage) -> Transition:
-        return fn(ctx, *msg.args, **msg.kwargs)
+        bound = sig.bind(*msg.args, **msg.kwargs)
+        with scoped_ctx(ctx):
+            return fn(*bound.args, **bound.kwargs)
 
     return wrapped
 
@@ -63,26 +69,49 @@ class CoBranchYield:
 
 class TransitionCoroutineFn(Protocol):
     def __call__(
-        self, ctx: Ctx, *args: Any, **kwargs: Any
+        self, *args: Any, **kwargs: Any
     ) -> Coroutine[CoBranchYield, RawMessage | None, None]: ...
+
+
+_ctx = ContextVar[Ctx | None]("ctx")
+
+
+@contextmanager
+def scoped_ctx(ctx: Ctx):
+    token = _ctx.set(ctx)
+    try:
+        yield
+    finally:
+        _ctx.reset(token)
+
+
+def ctx() -> Ctx:
+    cx = _ctx.get()
+    if cx is None:
+        raise RuntimeError("ctx() called outside of a scoped context")
+    return cx
 
 
 def _wrap_coroutine_transition_fn(
     fn: TransitionCoroutineFn, parent_transition: Transition
 ) -> TransitionFn:
+    sig = inspect.signature(fn)
+
     def wrapped(ctx: Ctx, msg: RawMessage) -> Transition:
-        co = fn(ctx, *msg.args, **msg.kwargs)
-        try:
-            yield_params = co.send(None)
-        except StopIteration:
-            return parent_transition
+        bound = sig.bind(*msg.args, **msg.kwargs)
+        with scoped_ctx(ctx):
+            co = fn(*bound.args, **bound.kwargs)
+            try:
+                yield_params = co.send(None)
+            except StopIteration:
+                return parent_transition
         t = Transition()
 
         @t.add_branch(*yield_params.match_args, **yield_params.match_kwargs)
         def resume(ctx: Ctx, msg: RawMessage):
-            del ctx  # unused
             try:
-                yield_params = co.send(msg)
+                with scoped_ctx(ctx):
+                    yield_params = co.send(msg)
             except StopIteration:
                 return parent_transition
             t.branches[0].match_args = yield_params.match_args
@@ -148,7 +177,6 @@ class TransitionBranch:
         self.match_args = match_args
         self.match_kwargs = match_kwargs
         self.fn = fn
-        self.sig = inspect.signature(fn)
 
     def matches(self, msg: RawMessage) -> bool:
         if (
@@ -162,17 +190,7 @@ class TransitionBranch:
         return False
 
     def call(self, ctx: Ctx, msg: RawMessage) -> Transition:
-        bound = self.sig.bind(ctx, *msg.args, **msg.kwargs)
-        return self.fn(*bound.args, **bound.kwargs)
-
-
-def wait(*args: Any, **kwargs: Any):
-    def decorator(fn: TransitionImplFn):
-        t = Transition()
-        t.branch(*args, **kwargs)(fn)
-        return t
-
-    return decorator
+        return self.fn(ctx, msg)
 
 
 class Node:
@@ -228,6 +246,30 @@ class EventLoop:
             self.epoch += 1
 
 
+def send(addr: Addr, *args: Any, **kwargs: Any):
+    ctx().send(addr, *args, **kwargs)
+
+
+def self() -> Addr:
+    return ctx().self
+
+
+async def wait(*args: Any, **kwargs: Any) -> tuple[Any, ...]:
+    return await ctx().wait(*args, **kwargs)
+
+
+def log(**kwargs: Any):
+    for k, v in kwargs.items():
+        ctx().state[k] = v
+
+
+async def ask(addr: Addr, method: Any, *args: Any, **kwargs: Any) -> Any:
+    ref = Ref()
+    send(addr, method, self(), ref, *args, **kwargs)
+    result, *_ = await wait(ref)
+    return result
+
+
 def main():
     class Add(object): ...
 
@@ -237,38 +279,29 @@ def main():
         adder = Transition()
 
         @adder.branch(Add)
-        def add(ctx: Ctx, sender: Addr, ref: Ref, a: int, b: int):
-            ctx.send(sender, ref, a + b)
-
-            return adder
+        async def add(sender: Addr, ref: Ref, a: int, b: int):
+            send(sender, ref, a + b)
 
         return adder
 
     def make_main(adder: Addr):
-        main = Transition()
-
         @dataclass
         class State:
             i: int = 0
 
         state = State()
 
+        main = Transition()
+
         @main.branch(Loop)
-        def start(ctx: Ctx):
-            ctx.send(ctx.self, Loop)
+        async def start():
+            send(self(), Loop)
 
-            ref = Ref()
-            ctx.send(adder, Add, ctx.self, ref, 2, state.i)
+            result = await ask(adder, Add, state.i, 10)
 
-            @wait(ref)
-            def recv_result(ctx: Ctx, result: int):
-                ctx.state["result"] = result
+            log(result=result)
 
-                state.i += 1
-
-                return main
-
-            return recv_result
+            state.i += 1
 
         return main
 
