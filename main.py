@@ -26,10 +26,11 @@ class Ref:
 
 
 class Ctx:
-    def __init__(self, state: dict[str, Any], self_addr: Addr) -> None:
+    def __init__(self, state: dict[str, Any], self_addr: Addr, epoch_idx: int) -> None:
         self.state = state
         self.self = self_addr
         self.sent_messages: list[tuple[Addr, RawMessage]] = []
+        self.epoch_idx = epoch_idx
 
     def send(self, addr: Addr, *args: Any, **kwargs: Any) -> None:
         self.sent_messages.append((addr, RawMessage(args, frozendict(kwargs))))
@@ -200,8 +201,10 @@ class Node:
         self.state = state
         self.inbox: list[RawMessage] = []
 
-    def run(self, fuel: int, self_addr: Addr) -> list[tuple[Addr, RawMessage]]:
-        ctx = Ctx(state=self.state, self_addr=self_addr)
+    def run(
+        self, fuel: int, self_addr: Addr, epoch_idx: int
+    ) -> list[tuple[Addr, RawMessage]]:
+        ctx = Ctx(state=self.state, self_addr=self_addr, epoch_idx=epoch_idx)
         for _ in range(fuel):
             if (found := self.current_transition.find_message(self.inbox)) is None:
                 break
@@ -239,7 +242,11 @@ class EventLoop:
     def run(self, epochs: int = 1):
         for _ in range(epochs):
             for addr, node in self.nodes.items():
-                sent_messages = node.run(self.fuel_per_epoch, addr)
+                sent_messages = node.run(
+                    fuel=self.fuel_per_epoch,
+                    self_addr=addr,
+                    epoch_idx=self.epoch,
+                )
                 for dest_addr, raw_msg in sent_messages:
                     self.nodes[dest_addr].inbox.append(raw_msg)
             self.collect_data()
@@ -270,10 +277,42 @@ async def ask(addr: Addr, method: Any, *args: Any, **kwargs: Any) -> Any:
     return result
 
 
+def now() -> int:
+    return ctx().epoch_idx
+
+
 def main():
     class Add(object): ...
 
     class Loop(object): ...
+
+    class Sleep(object): ...
+
+    def make_timer():
+        timer = Transition()
+
+        waiting_tasks: dict[Ref, tuple[Addr, int]] = {}
+
+        @timer.branch(Sleep)
+        async def sleep(sender: Addr, ref: Ref, duration: int):
+            wake_time = now() + duration
+            waiting_tasks[ref] = (sender, wake_time)
+
+        @timer.branch(Loop)
+        async def loop():
+            send(self(), Loop)
+
+            current_time = now()
+            to_wake = [
+                ref
+                for ref, (_, wake_time) in waiting_tasks.items()
+                if wake_time <= current_time
+            ]
+            for ref in to_wake:
+                sender, _ = waiting_tasks.pop(ref)
+                send(sender, ref)
+
+        return timer
 
     def make_adder():
         adder = Transition()
@@ -284,7 +323,7 @@ def main():
 
         return adder
 
-    def make_main(adder: Addr):
+    def make_main(adder: Addr, timer: Addr):
         @dataclass
         class State:
             i: int = 0
@@ -298,8 +337,9 @@ def main():
             send(self(), Loop)
 
             result = await ask(adder, Add, state.i, 10)
-
             log(result=result)
+
+            await ask(timer, Sleep, 1)
 
             state.i += 1
 
@@ -307,7 +347,8 @@ def main():
 
     event_loop = EventLoop()
     event_loop.spawn(Addr("adder"), make_adder())
-    event_loop.spawn(Addr("main"), make_main(Addr("adder")), Loop)
+    event_loop.spawn(Addr("timer"), make_timer(), Loop)
+    event_loop.spawn(Addr("main"), make_main(Addr("adder"), Addr("timer")), Loop)
     event_loop.data_collection_paths.append((Addr("main"), "result"))
     event_loop.run(epochs=10)
 
