@@ -16,6 +16,7 @@ from typing import (
     Protocol,
     Self,
     Sequence,
+    cast,
 )
 from uuid import UUID, uuid4
 
@@ -265,37 +266,43 @@ class SMBuilderTransition(Protocol):
     def __call__(self, msg: Message) -> StateMachine: ...
 
 
-class SMBuilder:
+class SMBuilder(NoOpInit):
     def __init__(self):
-        self.root_sm = BuilderSM()
-        self.branches: list[tuple[Matcher, SMBuilderTransition]] = []
+        self.branches = list[tuple[Matcher, SMBuilderTransition]]()
 
-    def add_branch(self, matcher: Matcher, transition: SMBuilderTransition):
-        self.branches.append((matcher, transition))
-
-    def build(self) -> StateMachine:
-        for i, (_, transition) in enumerate(self.branches):
-            self.root_sm.branches[i] = transition
-        matcher = SelectionMatcher(
+    @property
+    def matcher(self) -> Matcher:
+        return SelectionMatcher(
             *(
                 BranchIDMatcher(matcher, branch_id=i)
                 for i, (matcher, _) in enumerate(self.branches)
             )
         )
-        self.root_sm.matcher = matcher
-        return self.root_sm
-
-
-class BuilderSM(NoOpInit):
-    def __init__(self):
-        self.matcher = SelectionMatcher()
-        self.branches = dict[int, SMBuilderTransition]()
 
     def next(self, ctx: Context, match: MatchResult, msg: Message) -> StateMachine:
-        transition = self.branches.get(match.branch_id)
-        assert transition is not None, "No transition for branch_id"
+        transition = self.branches[cast(int, match.branch_id)][1]
         with scoped_context(ctx):
             return transition(_filter_message(msg, match))
+
+    def add_branch(self, matcher: Matcher, transition: SMBuilderTransition):
+        self.branches.append((matcher, transition))
+
+    def branch_handler(self, *match_args: Any, **match_kwargs: Any):
+        def decorator(fn: Callable[..., SMCoroutine] | Callable[..., StateMachine]):
+            if inspect.iscoroutinefunction(fn):
+                self.add_branch(
+                    matcher=SingleMatcher(match_args, match_kwargs),
+                    transition=async_transition(continuation=self)(handler(fn)),
+                )
+            elif inspect.isfunction(fn):
+                self.add_branch(
+                    matcher=SingleMatcher(match_args, match_kwargs),
+                    transition=handler(fn),
+                )
+            else:
+                raise TypeError("Expected a function or coroutine function")
+
+        return decorator
 
 
 class HandlerFn[T](Protocol):
@@ -366,10 +373,9 @@ def build_state_machine() -> Generator[StateMachine]:
     builder = SMBuilder()
     token = _builder_var.set(builder)
     try:
-        yield builder.root_sm
+        yield builder
     finally:
         _builder_var.reset(token)
-        builder.build()
 
 
 def branch(*match_args: Any, **match_kwargs: Any):
@@ -396,7 +402,7 @@ def async_branch_handler(*match_args: Any, **match_kwargs: Any):
 
     def decorator(fn: Callable[..., SMCoroutine]):
         @branch(*match_args, **match_kwargs)
-        @async_transition(continuation=_builder().root_sm)
+        @async_transition(continuation=_builder())
         @handler
         @functools.wraps(fn)
         def handle(*args: Any, **kwargs: Any) -> SMCoroutine:
@@ -745,29 +751,29 @@ def make_queue(max_size: int = 10) -> StateMachineInit:
     items = []
     waiting: list[tuple[Addr, Ref]] = []
 
-    with build_state_machine() as queue:
+    queue = SMBuilder()
 
-        def log_size():
-            log(size=len(items))
+    def log_size():
+        log(size=len(items))
 
-        @async_branch_handler(Enqueue)
-        async def enqueue(sender: Addr, ref: Ref, item: Any):
-            if len(items) >= max_size:
-                send(sender, ref, QueueFull)
-            else:
-                items.append(item)
-                while waiting and items:
-                    send(*waiting.pop(0), items.pop(0))
-                log_size()
-                send(sender, ref, Ok)
+    @queue.branch_handler(Enqueue)
+    async def enqueue(sender: Addr, ref: Ref, item: Any):
+        if len(items) >= max_size:
+            send(sender, ref, QueueFull)
+        else:
+            items.append(item)
+            while waiting and items:
+                send(*waiting.pop(0), items.pop(0))
+            log_size()
+            send(sender, ref, Ok)
 
-        @async_branch_handler(Dequeue)
-        async def dequeue(sender: Addr, ref: Ref):
-            if items:
-                send(sender, ref, items.pop(0))
-                log_size()
-            else:
-                waiting.append((sender, ref))
+    @queue.branch_handler(Dequeue)
+    async def dequeue(sender: Addr, ref: Ref):
+        if items:
+            send(sender, ref, items.pop(0))
+            log_size()
+        else:
+            waiting.append((sender, ref))
 
     return queue
 
