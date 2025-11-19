@@ -300,18 +300,21 @@ class EventLoop:
 
     def run(self, epochs: int = 1):
         for _ in range(epochs):
+            sent_messages: list[tuple[Addr, RawMessage]] = []
             for addr, node in self.nodes.items():
-                sent_messages = node.run(
-                    fuel=self.fuel_per_epoch,
-                    self_addr=addr,
-                    epoch_idx=self.epoch,
-                    event_loop=self,
+                sent_messages.extend(
+                    node.run(
+                        fuel=self.fuel_per_epoch,
+                        self_addr=addr,
+                        epoch_idx=self.epoch,
+                        event_loop=self,
+                    )
                 )
-                for dest_addr, raw_msg in sent_messages:
-                    try:
-                        self.nodes[dest_addr].inbox.append(raw_msg)
-                    except KeyError:
-                        raise RuntimeError(f"Address unknown: {dest_addr}")
+            for dest_addr, raw_msg in sent_messages:
+                try:
+                    self.nodes[dest_addr].inbox.append(raw_msg)
+                except KeyError:
+                    raise RuntimeError(f"Unknown address: {dest_addr}")
             self.collect_data()
             self.epoch += 1
 
