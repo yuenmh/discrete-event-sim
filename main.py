@@ -28,6 +28,11 @@ class Message:
     args: tuple[Any, ...]
     kwargs: frozendict[str, Any]
 
+    def __repr__(self) -> str:
+        args_strs = (repr(arg) for arg in self.args)
+        kwargs_strs = (f"{k}={v!r}" for k, v in self.kwargs.items())
+        return f"{type(self).__name__}({', '.join((*args_strs, *kwargs_strs))})"
+
 
 def message(*args: Any, **kwargs: Any) -> Message:
     return Message(args, frozendict(kwargs))
@@ -37,13 +42,27 @@ def message(*args: Any, **kwargs: Any) -> Message:
 class Addr:
     name: str
 
+    def __repr__(self) -> str:
+        return f"{type(self).__name__}({self.name!r})"
+
 
 @dataclass(frozen=True, slots=True)
 class Ref:
     uuid: UUID = field(default_factory=uuid4)
 
+    def __repr__(self) -> str:
+        return f"{type(self).__name__}({str(self.uuid)!r})"
 
-class Atom:
+
+class _AtomMeta(type):
+    def __str__(cls) -> str:
+        return cls.__name__
+
+    def __repr__(cls) -> str:
+        return str(cls)
+
+
+class Atom(metaclass=_AtomMeta):
     pass
 
 
@@ -255,6 +274,11 @@ class BranchIDMatcher(Matcher):
     def match(self, msg: Message) -> MatchResult:
         return replace(self.inner.match(msg), branch_id=self.branch_id)
 
+    def __repr__(self) -> str:
+        return (
+            f"{type(self).__name__}(inner={self.inner!r}, branch_id={self.branch_id!r})"
+        )
+
 
 class SingleMatcher(Matcher):
     def __init__(
@@ -286,6 +310,12 @@ class SingleMatcher(Matcher):
             matched=True, matched_args=matched_args, matched_kwargs=matched_kwargs
         )
 
+    def __repr__(self) -> str:
+        return (
+            f"{type(self).__name__}(args={self.args!r}, kwargs={self.kwargs!r}, "
+            f"branch_id={self.branch_id!r})"
+        )
+
 
 class SelectionMatcher(Matcher):
     def __init__(self, *options: Matcher):
@@ -297,6 +327,10 @@ class SelectionMatcher(Matcher):
             if result.matched:
                 return result
         return MatchResult(matched=False)
+
+    def __repr__(self) -> str:
+        options_str = ", ".join(repr(option) for option in self.options)
+        return f"{type(self).__name__}({options_str})"
 
 
 class Context(Protocol):
@@ -313,30 +347,54 @@ class StateMachine(Protocol):
     def matcher(self) -> Matcher: ...
     def next(self, ctx: Context, match: MatchResult, msg: Message) -> StateMachine: ...
 
+    @property
+    def sm(self) -> Self: ...
+
+    @property
+    def messages(self) -> Sequence[Message]: ...
+
 
 def next_state(
     sm: StateMachine, ctx: Context, msgs: Sequence[Message]
 ) -> tuple[int, StateMachine] | None:
     for i, msg in enumerate(msgs):
         if match := sm.matcher.match(msg):
+            print("advance state", ctx.self_addr, sm.matcher, msg)
             next_sm = sm.next(ctx, match, msg)
             return i, next_sm
     return None
 
 
+class StateMachineInit(Protocol):
+    @property
+    def sm(self) -> StateMachine: ...
+
+    @property
+    def messages(self) -> Sequence[Message]: ...
+
+
+class NoOpInit:
+    @property
+    def sm(self) -> Self:
+        return self
+
+    @property
+    def messages(self) -> Sequence[Message]:
+        return ()
+
+
 @dataclass
-class StateMachineInit:
+class StateMachineInitImpl:
     sm: StateMachine
     messages: Sequence[Message] = ()
 
 
 def initialize(sm: StateMachine, *msgs: Message) -> StateMachineInit:
-    return StateMachineInit(sm, msgs)
+    return StateMachineInitImpl(sm, msgs)
 
 
 @dataclass
 class ResumeSM:
-    ctx: Context
     match: MatchResult
     msg: Message
 
@@ -356,22 +414,38 @@ def _filter_message(msg: Message, match: MatchResult) -> Message:
 type SMCoroutine = Coroutine[Matcher, ResumeSM | None, None]
 
 
-class CoroutineSM:
+class CoroutineSM(NoOpInit):
     def __init__(self, co: SMCoroutine, continuation: StateMachine | None = None):
         self.co = co
+        self.immediate_continue = None
         try:
             self.matcher = co.send(None)
         except StopIteration:
-            self.matcher = SelectionMatcher()
+            if continuation is not None:
+                self.matcher = continuation.matcher
+                self.immediate_continue = continuation
+            else:
+                raise RuntimeError(
+                    "Coroutine finished immediately without a continuation"
+                )
         self.continuation = continuation
 
     def next(self, ctx: Context, match: MatchResult, msg: Message) -> StateMachine:
+        if self.immediate_continue is not None:
+            print("immediate continue", ctx.self_addr)
+            return self.immediate_continue
         try:
-            next_matcher = self.co.send(ResumeSM(ctx=ctx, match=match, msg=msg))
+            with scoped_context(ctx):
+                next_matcher = self.co.send(ResumeSM(match=match, msg=msg))
+                print("use coroutine", ctx.self_addr)
+                # print("next matcher", next_matcher)
             self.matcher = next_matcher
+            # print("next", ctx.self_addr, self.matcher)
             return self
         except StopIteration:
+            print("coroutine finished", ctx.self_addr)
             if self.continuation is not None:
+                # print("continue to", ctx.self_addr, self.continuation.matcher)
                 return self.continuation
 
         self.matcher = SelectionMatcher()
@@ -379,7 +453,7 @@ class CoroutineSM:
 
 
 class SMBuilderTransition(Protocol):
-    def __call__(self, ctx: Context, msg: Message) -> StateMachine: ...
+    def __call__(self, msg: Message) -> StateMachine: ...
 
 
 class SMBuilder:
@@ -403,7 +477,7 @@ class SMBuilder:
         return self.root_sm
 
 
-class BuilderSM:
+class BuilderSM(NoOpInit):
     def __init__(self):
         self.matcher = SelectionMatcher()
         self.branches = dict[int, SMBuilderTransition]()
@@ -411,38 +485,56 @@ class BuilderSM:
     def next(self, ctx: Context, match: MatchResult, msg: Message) -> StateMachine:
         transition = self.branches.get(match.branch_id)
         assert transition is not None, "No transition for branch_id"
-        return transition(ctx, _filter_message(msg, match))
+        with scoped_context(ctx):
+            return transition(_filter_message(msg, match))
 
 
 class HandlerFn[T](Protocol):
-    def __call__(self, ctx: Context, msg: Message) -> T: ...
+    def __call__(self, msg: Message) -> T: ...
 
 
 _context_var = ContextVar[Context | None]("context")
 
 
+def context() -> Context:
+    ctx = _context_var.get()
+    if ctx is None:
+        raise RuntimeError("context() called outside of a scoped context")
+    return ctx
+
+
+@contextmanager
+def scoped_context(ctx: Context):
+    token = _context_var.set(ctx)
+    try:
+        yield
+    finally:
+        _context_var.reset(token)
+
+
 def handler[T](fn: Callable[..., T]) -> HandlerFn[T]:
     sig = inspect.signature(fn)
 
-    def wrapped(ctx: Context, msg: Message) -> T:
+    def wrapped(msg: Message) -> T:
         bound = sig.bind(*msg.args, **msg.kwargs)
-        token = _context_var.set(ctx)
         result = fn(*bound.args, **bound.kwargs)
-        _context_var.reset(token)
         return result
+
+    wrapped.__name__ = fn.__name__
 
     return wrapped
 
 
 class SMBuilderAsyncTransition(Protocol):
-    def __call__(self, ctx: Context, msg: Message) -> SMCoroutine: ...
+    def __call__(self, msg: Message) -> SMCoroutine: ...
 
 
 def async_transition(continuation: StateMachine | None = None):
     def decorator(transition: SMBuilderAsyncTransition):
         @functools.wraps(transition)
-        def wrapped(ctx: Context, msg: Message) -> StateMachine:
-            return CoroutineSM(co=transition(ctx, msg), continuation=continuation)
+        def wrapped(msg: Message) -> StateMachine:
+            # print("wrapper called", transition.__name__, msg, continuation.matcher)
+            return CoroutineSM(co=transition(msg), continuation=continuation)
 
         return wrapped
 
@@ -455,7 +547,7 @@ _builder_var = ContextVar[SMBuilder | None]("builder")
 def _builder() -> SMBuilder:
     builder = _builder_var.get()
     if builder is None:
-        raise RuntimeError("Called outside of build_state_machine context")
+        raise RuntimeError("_builder() called outside of build_state_machine context")
     return builder
 
 
@@ -467,13 +559,13 @@ def build_state_machine() -> Generator[StateMachine]:
         yield builder.root_sm
     finally:
         _builder_var.reset(token)
+        builder.build()
 
 
 def branch(*match_args: Any, **match_kwargs: Any):
     def decorator(fn: HandlerFn[StateMachine]):
         _builder().add_branch(
-            matcher=SingleMatcher(match_args, match_kwargs),
-            transition=cast(HandlerFn[StateMachine], fn),
+            matcher=SingleMatcher(match_args, match_kwargs), transition=fn
         )
 
     return decorator
@@ -493,9 +585,13 @@ def async_branch_handler(*match_args: Any, **match_kwargs: Any):
     """
 
     def decorator(fn: Callable[..., SMCoroutine]):
-        branch(*match_args, **match_kwargs)(
-            async_transition(continuation=_builder().root_sm)(handler(fn))
-        )
+        @branch(*match_args, **match_kwargs)
+        @async_transition(continuation=_builder().root_sm)
+        @handler
+        @functools.wraps(fn)
+        def handle(*args: Any, **kwargs: Any) -> SMCoroutine:
+            # print("handle called", fn.__name__, args, kwargs)
+            return fn(*args, **kwargs)
 
     return decorator
 
@@ -558,6 +654,7 @@ class Node:
         ctx = ContextImpl(event_loop=event_loop, self_addr=self_addr, sent_messages=[])
         for _ in range(fuel):
             result = next_state(self.sm, ctx=ctx, msgs=self.inbox)
+            # print(self_addr, self.inbox, self.sm.matcher)
             if result is not None:
                 i, next_sm = result
                 self.sm = next_sm
@@ -632,23 +729,39 @@ class EventLoop:
 
 
 def send(addr: Addr, *args: Any, **kwargs: Any):
-    ctx().send(addr, *args, **kwargs)
+    context().sent_messages.append((addr, message(*args, **kwargs)))
 
 
 def self() -> Addr:
-    return ctx().self
+    return context().self_addr
+
+
+@types.coroutine
+def _wait_inner(
+    matcher: Matcher,
+) -> Generator[Matcher, ResumeSM, tuple[MatchResult, Message]]:
+    resume = yield matcher
+    return resume.match, resume.msg
 
 
 async def wait(*args: Any, **kwargs: Any) -> tuple[Any, ...]:
-    return await ctx().wait(*args, **kwargs)
+    match, msg = await _wait_inner(SingleMatcher(args, kwargs))
+    msg = _filter_message(msg, match)
+    return *msg.args, msg.kwargs
 
 
 def log(msg: str | None = None, /, **kwargs: Any):
     if msg is not None:
         kwargs["_msg"] = msg
-    ctx()._event_loop.logs.append(
-        LogEntry(epoch=ctx().epoch_idx, addr=ctx().self, data=kwargs)
-    )
+    context().event_loop.logs.append(LogEntry(epoch=now(), addr=self(), data=kwargs))
+
+
+def now() -> int:
+    return context().event_loop.epoch
+
+
+def rng() -> Random:
+    return context().event_loop.rngs[ctx().self]
 
 
 async def ask(addr: Addr, method: Any, *args: Any, **kwargs: Any) -> Any:
@@ -656,14 +769,6 @@ async def ask(addr: Addr, method: Any, *args: Any, **kwargs: Any) -> Any:
     send(addr, method, self(), ref, *args, **kwargs)
     result, *_ = await wait(ref)
     return result
-
-
-def now() -> int:
-    return ctx().epoch_idx
-
-
-def rng() -> Random:
-    return ctx()._event_loop.rngs[ctx().self]
 
 
 class Loop(Atom): ...
@@ -711,7 +816,7 @@ class TimerSpec:
                     sender, _ = waiting_tasks.pop(ref)
                     send(sender, ref)
 
-        return StateMachineInit(timer, [message(Loop)])
+        return initialize(timer, message(Loop))
 
 
 RUNTIME_SPECS = (TimerSpec(),)
@@ -757,11 +862,11 @@ def test_simple():
         with build_state_machine() as adder:
 
             @async_branch_handler(Add)
-            @responder
-            async def add(a: int, b: int):
-                return a + b
+            async def add(sender: Addr, ref: Ref, a: int, b: int):
+                # print("adder called")
+                send(sender, ref, a + b)
 
-        return initialize(adder)
+        return adder
 
     def make_main(adder: Addr):
         @dataclass
@@ -770,28 +875,23 @@ def test_simple():
 
         state = State()
 
-        with build_state_machine() as main:
+        @loop
+        async def main():
+            # print("before")
+            result = await ask(adder, Add, state.i, 10)
+            # print("after")
+            log(result=result)
 
-            @async_branch_handler(Loop)
-            async def start():
-                send(self(), Loop)
+            state.i += 1
 
-                result = await ask(adder, Add, state.i, 10)
-                log(result=result)
-
-                await sleep(1)
-
-                state.i += 1
-
-        return initialize(main, message(Loop))
+        return main
 
     adder_addr = Addr("adder")
 
     event_loop = EventLoop()
-    event_loop.spawn_spec(*RUNTIME_SPECS)
     event_loop.spawn(adder_addr, make_adder())
     event_loop.spawn(Addr("main"), make_main(adder_addr))
-    event_loop.run(epochs=100)
+    event_loop.run(epochs=20)
 
     for entry in event_loop.logs:
         print(entry)
@@ -813,33 +913,33 @@ class QueueFull(Atom): ...
 class Ok(Atom): ...
 
 
-def make_queue(max_size: int = 10):
+def make_queue(max_size: int = 10) -> StateMachineInit:
     items = []
     waiting: list[tuple[Addr, Ref]] = []
 
-    queue = Transition()
+    with build_state_machine() as queue:
 
-    def log_size():
-        log(size=len(items))
+        def log_size():
+            log(size=len(items))
 
-    @queue.branch(Enqueue)
-    async def enqueue(sender: Addr, ref: Ref, item: Any):
-        if len(items) >= max_size:
-            send(sender, ref, QueueFull)
-        else:
-            items.append(item)
-            while waiting and items:
-                send(*waiting.pop(0), items.pop(0))
-            log_size()
-            send(sender, ref, Ok)
+        @async_branch_handler(Enqueue)
+        async def enqueue(sender: Addr, ref: Ref, item: Any):
+            if len(items) >= max_size:
+                send(sender, ref, QueueFull)
+            else:
+                items.append(item)
+                while waiting and items:
+                    send(*waiting.pop(0), items.pop(0))
+                log_size()
+                send(sender, ref, Ok)
 
-    @queue.branch(Dequeue)
-    async def dequeue(sender: Addr, ref: Ref):
-        if items:
-            send(sender, ref, items.pop(0))
-            log_size()
-        else:
-            waiting.append((sender, ref))
+        @async_branch_handler(Dequeue)
+        async def dequeue(sender: Addr, ref: Ref):
+            if items:
+                send(sender, ref, items.pop(0))
+                log_size()
+            else:
+                waiting.append((sender, ref))
 
     return queue
 
