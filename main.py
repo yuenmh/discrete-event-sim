@@ -484,9 +484,13 @@ class LogEntry:
     addr: Addr
     data: dict[str, Any]
 
+    @property
+    def msg(self) -> str | None:
+        return self.data.get("_msg")
+
     def __str__(self) -> str:
-        if "_msg" in self.data:
-            msg = f"{self.data['_msg']} "
+        if self.msg is not None:
+            msg = f"{self.msg} "
         else:
             msg = ""
         data = " ".join(f"{k}={v!r}" for k, v in self.data.items() if k != "_msg")
@@ -497,8 +501,6 @@ class EventLoop:
     def __init__(self):
         self.nodes = dict[Addr, Node]()
         self.fuel_per_epoch = 10
-        self.data_collection_paths: list[tuple[Addr, str]] = []
-        self.data: list[DataPoint] = []
         self.logs: list[LogEntry] = []
         self.epoch = 0
         self.rngs = dict[Addr, Random]()
@@ -558,6 +560,13 @@ async def wait(*args: Any, **kwargs: Any) -> tuple[Any, ...]:
     return *msg.args, msg.kwargs
 
 
+async def select(*options: Message) -> tuple[Any, ...]:
+    _, msg = await _wait_inner(
+        SelectionMatcher(*(SingleMatcher(opt.args, opt.kwargs) for opt in options))
+    )
+    return *msg.args, msg.kwargs
+
+
 def log(msg: str | None = None, /, **kwargs: Any):
     if msg is not None:
         kwargs["_msg"] = msg
@@ -577,6 +586,20 @@ async def ask(addr: Addr, method: Any, *args: Any, **kwargs: Any) -> Any:
     send(addr, method, self(), ref, *args, **kwargs)
     result, *_ = await wait(ref)
     return result
+
+
+async def ask_timeout(
+    timeout: int, addr: Addr, method: Any, *args: Any, **kwargs: Any
+) -> Any:
+    result_ref = Ref()
+    send(addr, method, self(), result_ref, *args, **kwargs)
+    sleep_ref = Ref()
+    send(_TIMER_ADDR, Sleep, self(), sleep_ref, timeout)
+    done_ref, *rest = await select(message(result_ref), message(sleep_ref))
+    if done_ref == result_ref:
+        return rest[0]
+    else:
+        raise TimeoutError(f"Timed out after {timeout} epochs")
 
 
 class Loop(Atom): ...
@@ -798,6 +821,29 @@ def test_producer_consumer():
         entry.data["dequeued"] for entry in event_loop.logs if "dequeued" in entry.data
     )
     assert dequeued == set(range(20))
+
+
+def test_timeout():
+    @loop
+    async def do_nothing():
+        await sleep(200)
+
+    @launch
+    async def main():
+        try:
+            await ask_timeout(10, Addr("do_nothing"), None)
+        except TimeoutError:
+            log("timed out")
+
+    event_loop = EventLoop()
+    event_loop.spawn_spec(*RUNTIME_SPECS)
+    event_loop.spawn(Addr("do_nothing"), do_nothing)
+    event_loop.spawn(Addr("main"), main)
+    event_loop.run(epochs=50)
+
+    assert any(
+        log.msg == "timed out" for log in event_loop.logs if log.addr.name == "main"
+    )
 
 
 def main():
