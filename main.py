@@ -1,7 +1,9 @@
 import functools
 import hashlib
 import inspect
+import sqlite3
 import types
+import warnings
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, field, replace
@@ -46,9 +48,17 @@ class Addr:
         return f"{type(self).__name__}({self.name!r})"
 
 
+def _deterministic_uuid() -> UUID:
+    if _context_var.get() is None:
+        warnings.warn("Ref created outside of a scoped context; using random UUID")
+        return uuid4()
+    else:
+        return UUID(bytes=rng().randbytes(16))
+
+
 @dataclass(frozen=True, slots=True)
 class Ref:
-    uuid: UUID = field(default_factory=uuid4)
+    uuid: UUID = field(default_factory=_deterministic_uuid)
 
     def __repr__(self) -> str:
         return f"{type(self).__name__}({str(self.uuid)!r})"
@@ -60,6 +70,9 @@ class _AtomMeta(type):
 
     def __repr__(cls) -> str:
         return str(cls)
+
+    def __instancecheck__(self, instance: Any, /) -> bool:
+        return type(instance) is self or instance is self
 
 
 class Atom(metaclass=_AtomMeta):
@@ -503,13 +516,41 @@ class LogEntry:
         return f"[{self.epoch:06}] [{self.addr.name}] {msg}{data}"
 
 
+@dataclass
+class RunResult:
+    logs: list[LogEntry]
+
+    def logs_sqlite(self) -> sqlite3.Connection:
+        conn = sqlite3.connect(":memory:")
+        conn.execute(
+            """
+            CREATE TABLE log (
+                epoch INTEGER,
+                addr TEXT,
+                msg TEXT,
+                data TEXT
+            )
+            """
+        )
+        for log in self.logs:
+            conn.execute(
+                "INSERT INTO log (epoch, addr, msg, data) VALUES (?, ?, ?, ?)",
+                (log.epoch, log.addr.name, log.msg, repr(log.data)),
+            )
+        conn.commit()
+        return conn
+
+
 class EventLoop:
-    def __init__(self):
+    def __init__(self, without_defaults: bool = False):
         self.nodes = dict[Addr, Node]()
         self.fuel_per_epoch = 10
         self.logs: list[LogEntry] = []
         self.epoch = 0
         self.rngs = dict[Addr, Random]()
+
+        if not without_defaults:
+            self.spawn_spec(*RUNTIME_SPECS)
 
     def spawn(
         self,
@@ -542,6 +583,8 @@ class EventLoop:
                 except KeyError:
                     raise RuntimeError(f"Unknown address: {dest_addr}")
             self.epoch += 1
+
+        return RunResult(logs=self.logs)
 
 
 def send(addr: Addr, *args: Any, **kwargs: Any):
@@ -747,6 +790,9 @@ class QueueFull(Atom): ...
 class Ok(Atom): ...
 
 
+class Err(Atom): ...
+
+
 def make_queue(max_size: int = 10) -> StateMachineInit:
     items = []
     waiting: list[tuple[Addr, Ref]] = []
@@ -813,7 +859,6 @@ def test_producer_consumer():
     queue_addr = Addr("queue")
 
     event_loop = EventLoop()
-    event_loop.spawn_spec(*RUNTIME_SPECS)
     event_loop.spawn(queue_addr, make_queue(max_size=30))
     event_loop.spawn(Addr("producer"), make_producer(Queue(queue_addr)))
     event_loop.spawn(Addr("consumer"), make_consumer(Queue(queue_addr)))
@@ -842,7 +887,6 @@ def test_timeout():
             log("timed out")
 
     event_loop = EventLoop()
-    event_loop.spawn_spec(*RUNTIME_SPECS)
     event_loop.spawn(Addr("do_nothing"), do_nothing)
     event_loop.spawn(Addr("main"), main)
     event_loop.run(epochs=50)
@@ -852,16 +896,109 @@ def test_timeout():
     )
 
 
-def main():
-    def make_worker(queue: Queue[None]):
+def run_experiment(
+    num_clients: int = 10,
+    num_workers: int = 4,
+    queue_size: int = 14,
+    num_epochs: int = 1000,
+):
+    def make_worker(queue: Queue[tuple[Addr, Ref]]):
         @loop
         async def start():
-            await queue.dequeue()
-            log("start task")
+            addr, ref = await queue.dequeue()
+            log("start task", ref=ref)
             await sleep(rng().randrange(5, 20))
-            log("finish task")
+            log("finish task", ref=ref)
+            send(addr, ref, Ok)
 
         return start
+
+    queue_addrs = [Addr(f"queue-{i}") for i in range(num_workers)]
+
+    load_balancer = SMBuilder()
+
+    class SubmitWork(Atom): ...
+
+    @load_balancer.branch_handler(SubmitWork)
+    async def submit_work(sender: Addr, ref: Ref):
+        worker_queue_addr = rng().choice(queue_addrs)
+        if await ask(worker_queue_addr, Enqueue, (sender, ref)) is QueueFull:
+            log("queue full", queue=worker_queue_addr)
+            send(sender, ref, Err)
+
+    lb_addr = Addr("load_balancer")
+
+    async def perform_work():
+        start = now()
+        match await ask(lb_addr, SubmitWork):
+            case Ok():
+                log("finished", latency=now() - start)
+            case Err():
+                log("failed", latency=now() - start)
+            case r:
+                print(r)
+                assert False
+
+    clients: list[StateMachineInit] = []
+
+    for _ in range(num_clients):
+
+        @launch
+        async def client():
+            while True:
+                await perform_work()
+
+        clients.append(client)
+
+    event_loop = EventLoop()
+    for i, queue_addr in enumerate(queue_addrs):
+        event_loop.spawn(queue_addr, make_queue(max_size=queue_size))
+        event_loop.spawn(Addr(f"worker-{i}"), make_worker(Queue(queue_addr)))
+    event_loop.spawn(lb_addr, load_balancer)
+    for i, client in enumerate(clients):
+        event_loop.spawn(Addr(f"client-{i}"), client)
+
+    result = event_loop.run(epochs=num_epochs)
+    return result
+
+
+def main():
+    for num_clients in [10, 20, 40, 50, 60]:
+        result = run_experiment(num_clients=num_clients, queue_size=12)
+
+        with result.logs_sqlite() as conn:
+            size = [
+                x
+                for (x,) in conn.execute(
+                    "select data->>'size' from log where addr like 'queue-%'"
+                ).fetchall()
+            ]
+            latency = [
+                x
+                for (x,) in conn.execute(
+                    "select data->>'latency' from log where addr like 'client-%' and msg='finished'"
+                ).fetchall()
+            ]
+            failed_latency = [
+                x
+                for (x,) in conn.execute(
+                    "select data->>'latency' from log where addr like 'client-%' and msg='failed'"
+                ).fetchall()
+            ]
+
+            # for entry in result.logs:
+            #     print(entry)
+            print(f"Experiment {num_clients=}")
+            print(
+                f"  Queue size mean={sum(size) / len(size):.3f} max={max(size)} min={min(size)}"
+            )
+            print(
+                f"  Latency mean={sum(latency) / len(latency):.3f} max={max(latency)} min={min(latency)}"
+            )
+            print(
+                f"  Tasks total={len(latency) + len(failed_latency)} failed={len(failed_latency)} fail_rate={len(failed_latency) / (len(latency) + len(failed_latency)):.2%}"
+            )
+            print()
 
 
 if __name__ == "__main__":
