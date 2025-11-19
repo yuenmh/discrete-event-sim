@@ -262,8 +262,12 @@ class LogEntry:
     data: dict[str, Any]
 
     def __str__(self) -> str:
-        data = " ".join(f"{k}={v!r}" for k, v in self.data.items())
-        return f"[{self.epoch:06}] [{self.addr.name}] {data}"
+        if "_msg" in self.data:
+            msg = f"{self.data['_msg']} "
+        else:
+            msg = ""
+        data = " ".join(f"{k}={v!r}" for k, v in self.data.items() if k != "_msg")
+        return f"[{self.epoch:06}] [{self.addr.name}] {msg}{data}"
 
 
 class EventLoop:
@@ -331,7 +335,9 @@ async def wait(*args: Any, **kwargs: Any) -> tuple[Any, ...]:
     return await ctx().wait(*args, **kwargs)
 
 
-def log(**kwargs: Any):
+def log(msg: str | None = None, /, **kwargs: Any):
+    if msg is not None:
+        kwargs["_msg"] = msg
     ctx()._event_loop.logs.append(
         LogEntry(epoch=ctx().epoch_idx, addr=ctx().self, data=kwargs)
     )
@@ -506,6 +512,9 @@ def make_queue(max_size: int = 10):
 
     queue = Transition()
 
+    def log_size():
+        log(size=len(items))
+
     @queue.branch(Enqueue)
     async def enqueue(sender: Addr, ref: Ref, item: Any):
         if len(items) >= max_size:
@@ -514,12 +523,14 @@ def make_queue(max_size: int = 10):
             items.append(item)
             while waiting and items:
                 send(*waiting.pop(0), items.pop(0))
+            log_size()
             send(sender, ref, Ok)
 
     @queue.branch(Dequeue)
     async def dequeue(sender: Addr, ref: Ref):
         if items:
             send(sender, ref, items.pop(0))
+            log_size()
         else:
             waiting.append((sender, ref))
 
@@ -578,7 +589,15 @@ def test_producer_consumer():
 
 
 def main():
-    pass
+    def make_worker(queue: Queue[None]):
+        @loop
+        async def start():
+            await queue.dequeue()
+            log("start task")
+            await sleep(rng().randrange(5, 20))
+            log("finish task")
+
+        return start
 
 
 if __name__ == "__main__":
