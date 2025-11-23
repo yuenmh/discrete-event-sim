@@ -966,16 +966,51 @@ def run_experiment(
 
     lb_addr = Addr("load_balancer")
 
+    def constant_retry(sleep_time: int):
+        def policy(_try_num: int) -> int:
+            return sleep_time
+
+        return policy
+
+    async def submit_work_wrapper(
+        n_retries: int = 5,
+        timeout: int | None = None,
+        policy: Callable[[int], int] = constant_retry(10),
+    ) -> bool:
+        submission_id = Ref()
+        for try_num in range(n_retries):
+            if timeout:
+                try:
+                    result = await ask_timeout(timeout, lb_addr, SubmitWork)
+                except TimeoutError:
+                    log(
+                        "timeout",
+                        after=timeout,
+                        try_num=try_num,
+                        submission_id=submission_id,
+                    )
+                    result = Err()
+            else:
+                result = await ask(lb_addr, SubmitWork)
+            match result:
+                case Ok():
+                    return True
+                case Err():
+                    await sleep(policy(try_num))
+                    log("retry", try_num=try_num, submission_id=submission_id)
+                case _:
+                    assert False
+        return False
+
     async def perform_work():
         start = now()
-        match await ask(lb_addr, SubmitWork):
-            case Ok():
-                log("finished", latency=now() - start)
-            case Err():
-                log("failed", latency=now() - start)
-            case r:
-                print(r)
-                assert False
+        success = await submit_work_wrapper(
+            n_retries=3, timeout=100, policy=constant_retry(20)
+        )
+        if success:
+            log("finished", latency=now() - start)
+        else:
+            log("failed", latency=now() - start)
 
     clients: list[StateMachineInit] = []
 
@@ -983,7 +1018,7 @@ def run_experiment(
 
         @launch
         async def client():
-            for _ in range(100):
+            for _ in range(50):
                 await perform_work()
             log("exited")
 
