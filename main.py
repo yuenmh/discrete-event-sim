@@ -519,6 +519,7 @@ class LogEntry:
 @dataclass
 class RunResult:
     logs: list[LogEntry]
+    num_epochs: int
 
     def logs_sqlite(self) -> sqlite3.Connection:
         conn = sqlite3.connect(":memory:")
@@ -541,11 +542,34 @@ class RunResult:
         return conn
 
 
+class StopCondition(Protocol):
+    def process_logs(self, logs: list[LogEntry]): ...
+    @property
+    def should_stop(self) -> bool: ...
+
+
+class StopAfterNodesExited:
+    def __init__(self, nodes: Sequence[Addr], exit_msg: str = "exited"):
+        self.nodes = set(nodes)
+        self.exit_msg = exit_msg
+        self.exited_nodes = set()
+
+    def process_logs(self, logs: list[LogEntry]):
+        for log in logs:
+            if log.msg == self.exit_msg and log.addr in self.nodes:
+                self.exited_nodes.add(log.addr)
+
+    @property
+    def should_stop(self) -> bool:
+        return self.exited_nodes == self.nodes
+
+
 class EventLoop:
     def __init__(self, without_defaults: bool = False):
         self.nodes = dict[Addr, Node]()
         self.fuel_per_epoch = 10
         self.logs: list[LogEntry] = []
+        self.new_logs: list[LogEntry] = []
         self.epoch = 0
         self.rngs = dict[Addr, Random]()
 
@@ -566,7 +590,7 @@ class EventLoop:
         for spec in specs:
             self.spawn(spec.addr, spec.init())
 
-    def run(self, epochs: int = 1):
+    def run(self, epochs: int = 1, condition: StopCondition | None = None):
         for _ in range(epochs):
             sent_messages: list[tuple[Addr, Message]] = []
             for addr, node in self.nodes.items():
@@ -582,9 +606,23 @@ class EventLoop:
                     self.nodes[dest_addr].inbox.append(raw_msg)
                 except KeyError:
                     raise RuntimeError(f"Unknown address: {dest_addr}")
-            self.epoch += 1
 
-        return RunResult(logs=self.logs)
+            if condition is not None:
+                condition.process_logs(self.new_logs)
+                if condition.should_stop:
+                    break
+
+            self.epoch += 1
+            self.commit_logs()
+
+        return RunResult(logs=self.logs, num_epochs=self.epoch)
+
+    def commit_logs(self):
+        self.logs.extend(self.new_logs)
+        self.new_logs.clear()
+
+    def append_log(self, log: LogEntry):
+        self.new_logs.append(log)
 
 
 def send(addr: Addr, *args: Any, **kwargs: Any):
@@ -619,7 +657,7 @@ async def select(*options: Message) -> tuple[Any, ...]:
 def log(msg: str | None = None, /, **kwargs: Any):
     if msg is not None:
         kwargs["_msg"] = msg
-    context().event_loop.logs.append(LogEntry(epoch=now(), addr=self(), data=kwargs))
+    context().event_loop.append_log(LogEntry(epoch=now(), addr=self(), data=kwargs))
 
 
 def now() -> int:
@@ -900,7 +938,7 @@ def run_experiment(
     num_clients: int = 10,
     num_workers: int = 4,
     queue_size: int = 14,
-    num_epochs: int = 1000,
+    num_epochs: int = 20000,
 ):
     def make_worker(queue: Queue[tuple[Addr, Ref]]):
         @loop
@@ -945,8 +983,9 @@ def run_experiment(
 
         @launch
         async def client():
-            while True:
+            for _ in range(100):
                 await perform_work()
+            log("exited")
 
         clients.append(client)
 
@@ -958,7 +997,8 @@ def run_experiment(
     for i, client in enumerate(clients):
         event_loop.spawn(Addr(f"client-{i}"), client)
 
-    result = event_loop.run(epochs=num_epochs)
+    condition = StopAfterNodesExited([Addr(f"client-{i}") for i in range(num_clients)])
+    result = event_loop.run(epochs=num_epochs, condition=condition)
     return result
 
 
@@ -988,7 +1028,7 @@ def main():
 
             # for entry in result.logs:
             #     print(entry)
-            print(f"Experiment {num_clients=}")
+            print(f"Experiment {num_clients=} num_epochs={result.num_epochs}")
             print(
                 f"  Queue size mean={sum(size) / len(size):.3f} max={max(size)} min={min(size)}"
             )
