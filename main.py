@@ -1,3 +1,4 @@
+import csv
 import functools
 import hashlib
 import inspect
@@ -1070,7 +1071,8 @@ def run_experiment(
 
 
 def main():
-    for num_clients in [10, 20, 40, 50, 60]:
+    data = []
+    for num_clients in range(1, 40, 1):
         result = run_experiment(num_clients=num_clients, queue_size=12)
 
         with result.logs_sqlite() as conn:
@@ -1106,6 +1108,26 @@ def main():
                 f"  Tasks total={len(latency) + len(failed_latency)} failed={len(failed_latency)} fail_rate={len(failed_latency) / (len(latency) + len(failed_latency)):.2%}"
             )
             print()
+
+            datum = {
+                "num_clients": num_clients,
+                "num_epochs": result.num_epochs,
+                "queue_size_mean": sum(size) / len(size),
+                "queue_size_max": max(size),
+                "queue_size_min": min(size),
+                "latency_mean": sum(latency) / len(latency),
+                "latency_max": max(latency),
+                "latency_min": min(latency),
+                "tasks_total": len(latency) + len(failed_latency),
+                "tasks_failed": len(failed_latency),
+                "fail_rate": len(failed_latency) / (len(latency) + len(failed_latency)),
+            }
+            data.append(datum)
+
+    with open("result.csv", newline="", mode="w") as f:
+        writer = csv.DictWriter(f, fieldnames=data[0].keys())
+        writer.writeheader()
+        writer.writerows(data)
 
 
 if __name__ == "__main__":
