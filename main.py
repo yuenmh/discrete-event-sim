@@ -978,11 +978,20 @@ def test_timeout():
     )
 
 
+def constant_retry(sleep_time: int):
+    def policy(_try_num: int) -> int:
+        return sleep_time
+
+    return policy
+
+
 def run_experiment(
     num_clients: int = 10,
     num_workers: int = 4,
     queue_size: int = 14,
     num_epochs: int = 20000,
+    num_retries: int = 3,
+    retry_policy: Callable[[int], int] = constant_retry(20),
 ):
     def make_worker(queue: Queue[tuple[Addr, Ref]]):
         @loop
@@ -1010,14 +1019,8 @@ def run_experiment(
 
     lb_addr = Addr("load_balancer")
 
-    def constant_retry(sleep_time: int):
-        def policy(_try_num: int) -> int:
-            return sleep_time
-
-        return policy
-
     async def submit_work_wrapper(
-        n_retries: int = 5,
+        n_retries: int = 3,
         timeout: int | None = None,
         policy: Callable[[int], int] = constant_retry(10),
     ) -> bool:
@@ -1049,7 +1052,9 @@ def run_experiment(
     async def perform_work():
         start = now()
         success = await submit_work_wrapper(
-            n_retries=3, timeout=100, policy=constant_retry(20)
+            n_retries=num_retries,
+            timeout=100,
+            policy=retry_policy,
         )
         if success:
             log("finished", latency=now() - start)
@@ -1158,8 +1163,29 @@ runner = Runner()
 
 
 @runner.trial(list(range(1, 40, 1)))
+def queue_size_01(num_clients: int):
+    result = run_experiment(num_clients=num_clients, queue_size=1)
+    datum = analyze_result(result)
+    return num_clients, {"num_clients": num_clients, **datum}
+
+
+@runner.trial(list(range(1, 40, 1)))
+def queue_size_06(num_clients: int):
+    result = run_experiment(num_clients=num_clients, queue_size=6)
+    datum = analyze_result(result)
+    return num_clients, {"num_clients": num_clients, **datum}
+
+
+@runner.trial(list(range(1, 40, 1)))
 def queue_size_12(num_clients: int):
     result = run_experiment(num_clients=num_clients, queue_size=12)
+    datum = analyze_result(result)
+    return num_clients, {"num_clients": num_clients, **datum}
+
+
+@runner.trial(list(range(1, 40, 1)))
+def no_retries(num_clients: int):
+    result = run_experiment(num_clients=num_clients, queue_size=12, num_retries=1)
     datum = analyze_result(result)
     return num_clients, {"num_clients": num_clients, **datum}
 
