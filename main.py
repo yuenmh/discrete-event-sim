@@ -2,12 +2,14 @@ import csv
 import functools
 import hashlib
 import inspect
+import multiprocessing
 import sqlite3
 import types
 import warnings
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, field, replace
+from operator import itemgetter
 from random import Random
 from typing import (
     Any,
@@ -1121,14 +1123,21 @@ def write_csv(path: str, data: list[dict]):
         writer.writerows(data)
 
 
-def main():
-    data = []
-    for num_clients in tqdm(range(1, 40, 1)):
-        result = run_experiment(num_clients=num_clients, queue_size=12)
-        datum = analyze_result(result)
-        data.append({"num_clients": num_clients, **datum})
+def experiment(num_clients: int):
+    result = run_experiment(num_clients=num_clients, queue_size=12)
+    datum = analyze_result(result)
+    return num_clients, {"num_clients": num_clients, **datum}
 
-    write_csv("result.csv", data)
+
+def main():
+    inputs = list(range(1, 40, 1))
+
+    pool = multiprocessing.Pool()
+    result = pool.imap_unordered(experiment, inputs)
+    data = list(tqdm(result, total=len(inputs)))
+    data.sort(key=itemgetter(0))
+
+    write_csv("result.csv", [datum for _, datum in data])
 
 
 if __name__ == "__main__":
