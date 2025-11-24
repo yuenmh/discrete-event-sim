@@ -675,6 +675,17 @@ async def ask(addr: Addr, method: Any, *args: Any, **kwargs: Any) -> Any:
     return result
 
 
+class _FusedRefSelect:
+    def __init__(self, refs: tuple[Ref, ...]):
+        self.refs = refs
+
+    def match(self, msg: Message) -> MatchResult:
+        for i, ref in enumerate(self.refs):
+            if msg.args and msg.args[0] == ref:
+                return MatchResult(matched=True, branch_id=i, matched_args={0})
+        return MatchResult(matched=False)
+
+
 async def ask_timeout(
     timeout: int, addr: Addr, method: Any, *args: Any, **kwargs: Any
 ) -> Any:
@@ -682,9 +693,9 @@ async def ask_timeout(
     send(addr, method, self(), result_ref, *args, **kwargs)
     sleep_ref = Ref()
     send(_TIMER_ADDR, Sleep, self(), sleep_ref, timeout)
-    done_ref, *rest = await select(message(result_ref), message(sleep_ref))
-    if done_ref == result_ref:
-        return rest[0]
+    result, msg = await _wait_inner(_FusedRefSelect((result_ref, sleep_ref)))
+    if result.branch_id == 0:
+        return msg.args[1]
     else:
         raise TimeoutError(f"Timed out after {timeout} epochs")
 
