@@ -475,6 +475,7 @@ class Node:
     def __init__(self, sm: StateMachine):
         self.sm = sm
         self.inbox: list[Message] = []
+        self.drop_hints: list[Matcher] = []
 
     def run(
         self, fuel: int, self_addr: Addr, event_loop: EventLoop
@@ -489,6 +490,20 @@ class Node:
             else:
                 break
         return ctx.sent_messages
+
+    def deliver(self, msg: Message):
+        for i, hint in enumerate(self.drop_hints):
+            if hint.match(msg):
+                self.drop_hints.pop(i)
+                return
+        self.inbox.append(msg)
+
+    def set_drop_hint(self, matcher: Matcher):
+        for i, msg in enumerate(self.inbox):
+            if matcher.match(msg):
+                self.inbox.pop(i)
+                return
+        self.drop_hints.append(matcher)
 
 
 @dataclass
@@ -603,7 +618,7 @@ class EventLoop:
                 )
             for dest_addr, raw_msg in sent_messages:
                 try:
-                    self.nodes[dest_addr].inbox.append(raw_msg)
+                    self.nodes[dest_addr].deliver(raw_msg)
                 except KeyError:
                     raise RuntimeError(f"Unknown address: {dest_addr}")
 
@@ -631,6 +646,10 @@ def send(addr: Addr, *args: Any, **kwargs: Any):
 
 def self() -> Addr:
     return context().self_addr
+
+
+def self_node() -> Node:
+    return context().event_loop.nodes[context().self_addr]
 
 
 @types.coroutine
@@ -695,8 +714,10 @@ async def ask_timeout(
     send(_TIMER_ADDR, Sleep, self(), sleep_ref, timeout)
     result, msg = await _wait_inner(_FusedRefSelect((result_ref, sleep_ref)))
     if result.branch_id == 0:
+        self_node().set_drop_hint(SingleMatcher((sleep_ref,), {}))
         return msg.args[1]
     else:
+        self_node().set_drop_hint(SingleMatcher((result_ref,), {}))
         raise TimeoutError(f"Timed out after {timeout} epochs")
 
 
