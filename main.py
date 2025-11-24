@@ -3,6 +3,7 @@ import functools
 import hashlib
 import inspect
 import multiprocessing
+import os
 import sqlite3
 import types
 import warnings
@@ -1123,21 +1124,48 @@ def write_csv(path: str, data: list[dict]):
         writer.writerows(data)
 
 
-def experiment(num_clients: int):
+class Runner:
+    def __init__(self):
+        self.runs = []
+
+    def trial(self, values: Sequence[Any], name: str | None = None):
+        def decorator(fn: Callable[..., Any]):
+            trial_name = name or fn.__name__.replace("_", "-")
+            self.runs.append((trial_name, fn, values))
+            return fn
+
+        return decorator
+
+    def run_all(self):
+        for name, fn, inputs in self.runs:
+            output_path = f"results/{name}.csv"
+            if os.path.exists(output_path):
+                print(f"Skip {name} (already exists)")
+                continue
+
+            print(f"Run {name}")
+
+            pool = multiprocessing.Pool()
+            result = pool.imap_unordered(fn, inputs)
+            data = list(tqdm(result, total=len(inputs)))
+            data.sort(key=itemgetter(0))
+            data = [datum for _, datum in data]
+
+            write_csv(output_path, data)
+
+
+runner = Runner()
+
+
+@runner.trial(list(range(1, 40, 1)))
+def queue_size_12(num_clients: int):
     result = run_experiment(num_clients=num_clients, queue_size=12)
     datum = analyze_result(result)
     return num_clients, {"num_clients": num_clients, **datum}
 
 
 def main():
-    inputs = list(range(1, 40, 1))
-
-    pool = multiprocessing.Pool()
-    result = pool.imap_unordered(experiment, inputs)
-    data = list(tqdm(result, total=len(inputs)))
-    data.sort(key=itemgetter(0))
-
-    write_csv("results/queue-size-12.csv", [datum for _, datum in data])
+    runner.run_all()
 
 
 if __name__ == "__main__":
