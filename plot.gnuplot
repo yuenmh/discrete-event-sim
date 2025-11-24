@@ -1,14 +1,14 @@
-set terminal pngcairo size 1400,1600 enhanced font 'CMU Serif,12'
+set terminal pngcairo enhanced size 1400,1600 font 'CMU Serif,12'
 set output ARG2
+
+file = ARG1
 
 set datafile separator ','
 set key autotitle columnhead
 set grid
 
-set multiplot layout 3,2 title ARG3
+set multiplot layout 3,2 title sprintf('Plot of {/"CMU Typewriter Text" %s}', file)
 set key top left
-
-file = ARG1
 
 set title 'Mean Queue Size'
 set xlabel 'num clients'

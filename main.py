@@ -1137,7 +1137,7 @@ def main():
     data = list(tqdm(result, total=len(inputs)))
     data.sort(key=itemgetter(0))
 
-    write_csv("result.csv", [datum for _, datum in data])
+    write_csv("results/queue-size-12.csv", [datum for _, datum in data])
 
 
 if __name__ == "__main__":
