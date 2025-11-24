@@ -24,6 +24,7 @@ from typing import (
 from uuid import UUID, uuid4
 
 from frozendict import frozendict
+from tqdm import tqdm
 
 
 @dataclass(frozen=True, slots=True)
@@ -1077,64 +1078,57 @@ def run_experiment(
     return result
 
 
-def main():
-    data = []
-    for num_clients in range(1, 40, 1):
-        result = run_experiment(num_clients=num_clients, queue_size=12)
+def analyze_result(result: RunResult):
+    with result.logs_sqlite() as conn:
+        size = [
+            x
+            for (x,) in conn.execute(
+                "select data->>'size' from log where addr like 'queue-%'"
+            ).fetchall()
+        ]
+        latency = [
+            x
+            for (x,) in conn.execute(
+                "select data->>'latency' from log where addr like 'client-%' and msg='finished'"
+            ).fetchall()
+        ]
+        failed_latency = [
+            x
+            for (x,) in conn.execute(
+                "select data->>'latency' from log where addr like 'client-%' and msg='failed'"
+            ).fetchall()
+        ]
 
-        with result.logs_sqlite() as conn:
-            size = [
-                x
-                for (x,) in conn.execute(
-                    "select data->>'size' from log where addr like 'queue-%'"
-                ).fetchall()
-            ]
-            latency = [
-                x
-                for (x,) in conn.execute(
-                    "select data->>'latency' from log where addr like 'client-%' and msg='finished'"
-                ).fetchall()
-            ]
-            failed_latency = [
-                x
-                for (x,) in conn.execute(
-                    "select data->>'latency' from log where addr like 'client-%' and msg='failed'"
-                ).fetchall()
-            ]
+        datum = {
+            "num_epochs": result.num_epochs,
+            "queue_size_mean": sum(size) / len(size),
+            "queue_size_max": max(size),
+            "queue_size_min": min(size),
+            "latency_mean": sum(latency) / len(latency),
+            "latency_max": max(latency),
+            "latency_min": min(latency),
+            "tasks_total": len(latency) + len(failed_latency),
+            "tasks_failed": len(failed_latency),
+            "fail_rate": len(failed_latency) / (len(latency) + len(failed_latency)),
+        }
+        return datum
 
-            # for entry in result.logs:
-            #     print(entry)
-            print(f"Experiment {num_clients=} num_epochs={result.num_epochs}")
-            print(
-                f"  Queue size mean={sum(size) / len(size):.3f} max={max(size)} min={min(size)}"
-            )
-            print(
-                f"  Latency mean={sum(latency) / len(latency):.3f} max={max(latency)} min={min(latency)}"
-            )
-            print(
-                f"  Tasks total={len(latency) + len(failed_latency)} failed={len(failed_latency)} fail_rate={len(failed_latency) / (len(latency) + len(failed_latency)):.2%}"
-            )
-            print()
 
-            datum = {
-                "num_clients": num_clients,
-                "num_epochs": result.num_epochs,
-                "queue_size_mean": sum(size) / len(size),
-                "queue_size_max": max(size),
-                "queue_size_min": min(size),
-                "latency_mean": sum(latency) / len(latency),
-                "latency_max": max(latency),
-                "latency_min": min(latency),
-                "tasks_total": len(latency) + len(failed_latency),
-                "tasks_failed": len(failed_latency),
-                "fail_rate": len(failed_latency) / (len(latency) + len(failed_latency)),
-            }
-            data.append(datum)
-
-    with open("result.csv", newline="", mode="w") as f:
+def write_csv(path: str, data: list[dict]):
+    with open(path, newline="", mode="w") as f:
         writer = csv.DictWriter(f, fieldnames=data[0].keys())
         writer.writeheader()
         writer.writerows(data)
+
+
+def main():
+    data = []
+    for num_clients in tqdm(range(1, 40, 1)):
+        result = run_experiment(num_clients=num_clients, queue_size=12)
+        datum = analyze_result(result)
+        data.append({"num_clients": num_clients, **datum})
+
+    write_csv("result.csv", data)
 
 
 if __name__ == "__main__":
