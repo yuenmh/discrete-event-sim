@@ -477,12 +477,18 @@ class Node:
         self.sm = sm
         self.inbox: list[Message] = []
         self.drop_hints: list[Matcher] = []
+        self.fuel_per_epoch: int | None = None
+        self.unlimited_fuel = False
 
     def run(
         self, fuel: int, self_addr: Addr, event_loop: EventLoop
     ) -> list[tuple[Addr, Message]]:
         ctx = ContextImpl(event_loop=event_loop, self_addr=self_addr, sent_messages=[])
-        for _ in range(fuel):
+        if self.unlimited_fuel:
+            range_ = iter(int, 1)
+        else:
+            range_ = range(fuel)
+        for _ in range_:
             result = next_state(self.sm, ctx=ctx, msgs=self.inbox)
             if result is not None:
                 i, next_sm = result
@@ -591,6 +597,7 @@ class EventLoop:
 
         if not without_defaults:
             self.spawn_spec(*RUNTIME_SPECS)
+            self.nodes[_TIMER_ADDR].unlimited_fuel = True
 
     def spawn(
         self,
@@ -612,7 +619,7 @@ class EventLoop:
             for addr, node in self.nodes.items():
                 sent_messages.extend(
                     node.run(
-                        fuel=self.fuel_per_epoch,
+                        fuel=node.fuel_per_epoch or self.fuel_per_epoch,
                         self_addr=addr,
                         event_loop=self,
                     )
