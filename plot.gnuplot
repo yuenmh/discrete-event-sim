@@ -1,4 +1,4 @@
-set terminal pngcairo enhanced size 1400,1600 font 'CMU Serif,12'
+set terminal pngcairo enhanced size 1400,1200 font 'CMU Serif,12'
 set output ARG2
 
 file = ARG1
@@ -7,7 +7,7 @@ set datafile separator ','
 set key autotitle columnhead
 set grid
 
-set multiplot layout 3,2 title sprintf('Plot of {/"CMU Typewriter Text" %s}', file)
+set multiplot layout 2,2 title sprintf('Plot of {/"CMU Typewriter Text" %s}', file)
 set key top left
 
 set yrange [0:*]

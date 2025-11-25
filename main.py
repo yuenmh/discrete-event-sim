@@ -17,6 +17,7 @@ from typing import (
     Callable,
     Coroutine,
     Generator,
+    Literal,
     Mapping,
     NamedTuple,
     Protocol,
@@ -1414,8 +1415,29 @@ def single_server_vary_queue_size(qs):
     return analyze_result(run_single_server_case(queue_size=qs))
 
 
+@runner.trial(["control", "test"])
+def multiple_servers(version: Literal["control", "test"]):
+    return analyze_result(
+        run_experiment(
+            num_workers=4,
+            queue_size=10,
+            num_retries=100_000,
+            num_epochs=40_000,
+            spike_offset=12000 if version == "test" else 100_000,
+            spike_duration=2000,
+            num_clients=12,
+            num_clients_spike=20,
+            num_clients_after_spike=12,
+            submit_timeout=100,
+            work_time_range=(26, 27),
+            inter_task_sleep_range=(42, 44),
+            retry_policy=constant_retry(2),
+        )
+    )
+
+
 def main():
-    runner.run_all(force=True, concurrent=False)
+    runner.run_all(force=False, concurrent=True)
 
 
 if __name__ == "__main__":
