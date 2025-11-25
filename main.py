@@ -475,6 +475,23 @@ class ContextImpl:
     sent_messages: list[tuple[Addr, Message]]
 
 
+class _LeakDetector:
+    def __init__(self, alpha: float = 0.1, threshold: float = 0.01):
+        self.ema_diff = 0
+        self.prev_value = None
+        self.alpha = alpha
+        self.threshold = threshold
+
+    def update(self, current_memory: int):
+        if self.prev_value is not None:
+            diff = current_memory - self.prev_value
+            self.ema_diff = self.alpha * diff + (1 - self.alpha) * self.ema_diff
+        self.prev_value = current_memory
+
+    def is_leaking(self):
+        return self.ema_diff > self.threshold
+
+
 class Node:
     def __init__(self, sm: StateMachine):
         self.sm = sm
@@ -482,10 +499,16 @@ class Node:
         self.drop_hints: list[Matcher] = []
         self.fuel_per_epoch: int | None = None
         self.unlimited_fuel = False
+        self.stopped = False
+        self._detector = _LeakDetector(alpha=0.01, threshold=0.4)
+        self._addr = None
 
     def run(
         self, fuel: int, self_addr: Addr, event_loop: EventLoop
     ) -> list[tuple[Addr, Message]]:
+        self._addr = self_addr
+        if self.stopped:
+            return []
         ctx = ContextImpl(event_loop=event_loop, self_addr=self_addr, sent_messages=[])
         if self.unlimited_fuel:
             range_ = iter(int, 1)
@@ -499,9 +522,17 @@ class Node:
                 self.inbox.pop(i)
             else:
                 break
+        self._analyze_inbox_growth()
         return ctx.sent_messages
 
+    def _analyze_inbox_growth(self):
+        self._detector.update(len(self.inbox))
+        if self._detector.is_leaking():
+            warnings.warn(f"{self._addr} inbox growing. size={len(self.inbox)}")
+
     def deliver(self, msg: Message):
+        if self.stopped:
+            return
         for i, hint in enumerate(self.drop_hints):
             if hint.match(msg):
                 self.drop_hints.pop(i)
@@ -592,7 +623,7 @@ class StopAfterNodesExited:
 class EventLoop:
     def __init__(self, without_defaults: bool = False):
         self.nodes = dict[Addr, Node]()
-        self.fuel_per_epoch = 10
+        self.fuel_per_epoch = 100
         self.logs: list[LogEntry] = []
         self.new_logs: list[LogEntry] = []
         self.epoch = 0
@@ -617,7 +648,7 @@ class EventLoop:
             self.spawn(spec.addr, spec.init())
 
     def run(self, epochs: int = 1, condition: StopCondition | None = None):
-        for _ in range(epochs):
+        for _ in tqdm(range(epochs), unit="epoch", total=epochs):
             sent_messages: list[tuple[Addr, Message]] = []
             for addr, node in self.nodes.items():
                 sent_messages.extend(
@@ -639,7 +670,6 @@ class EventLoop:
                     break
 
             self.epoch += 1
-            print(self.epoch)
             self.commit_logs()
 
         return RunResult(logs=self.logs, num_epochs=self.epoch)
@@ -1050,6 +1080,8 @@ def run_experiment(
         if await ask(worker_queue_addr, Enqueue, (sender, ref)) is QueueFull:
             log("queue full", queue=worker_queue_addr)
             send(sender, ref, Err)
+        else:
+            send(sender, ref, Ok)
 
     lb_addr = Addr("load_balancer")
 
@@ -1057,6 +1089,7 @@ def run_experiment(
         n_retries: int = 3,
         timeout: int | None = None,
         policy: Callable[[int], int] = constant_retry(10),
+        deadline: int | None = None,
     ) -> bool:
         submission_id = Ref()
         for try_num in range(n_retries):
@@ -1066,7 +1099,7 @@ def run_experiment(
                         timeout,
                         lb_addr,
                         SubmitWork,
-                        deadline=spike_offset + spike_duration,
+                        deadline=deadline,
                     )
                 except TimeoutError:
                     log(
@@ -1088,12 +1121,13 @@ def run_experiment(
                     assert False
         return False
 
-    async def perform_work():
+    async def perform_work(deadline: int | None = None):
         start = now()
         success = await submit_work_wrapper(
             n_retries=num_retries,
             timeout=100,
             policy=retry_policy,
+            deadline=deadline,
         )
         if success:
             log("finished", latency=now() - start)
@@ -1119,8 +1153,16 @@ def run_experiment(
                         and now() - start_time > spike_duration
                     ):
                         break
-                    await perform_work()
+                    # Ensure that outstanding requests are cancelled after the spike.
+                    # This is needed to correctly simulate clients exiting.
+                    deadline = (
+                        spike_offset + spike_duration
+                        if now() < spike_offset + spike_duration
+                        else None
+                    )
+                    await perform_work(deadline=deadline)
                 log("client exited", client_ix=client_ix)
+                self_node().stopped = True
 
             return client
 
