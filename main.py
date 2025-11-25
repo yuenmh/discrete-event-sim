@@ -511,7 +511,7 @@ class Node:
         self.fuel_per_epoch: int | None = None
         self.unlimited_fuel = False
         self.stopped = False
-        self._detector = _LeakDetector(alpha=0.09, threshold=0.2)
+        self._detector = _LeakDetector(alpha=0.09, threshold=0.1)
         self._addr = None
 
     def run(
@@ -540,7 +540,7 @@ class Node:
         self._detector.update(len(self.inbox))
         if self._detector.is_leaking():
             warnings.warn(f"{self._addr} inbox growing. size={len(self.inbox)}")
-            print(self.inbox)
+            print(self.inbox, self.sm.matcher)
 
     def deliver(self, msg: Message):
         if self.stopped:
@@ -759,6 +759,12 @@ class _FusedRefSelect:
         return MatchResult(matched=False)
 
 
+@dataclass
+class Timeout(TimeoutError):
+    msg: str | None = None
+    is_deadline: bool = False
+
+
 async def ask_timeout(
     timeout: int,
     addr: Addr,
@@ -784,10 +790,10 @@ async def ask_timeout(
         self_node().set_drop_hint(SingleMatcher((result_ref,), {}))
         if result.branch_id == 1:
             self_node().set_drop_hint(SingleMatcher((deadline_ref,), {}))
-            raise TimeoutError(f"Timed out after {timeout} epochs")
+            raise Timeout(f"Timed out after {timeout} epochs")
         else:
             self_node().set_drop_hint(SingleMatcher((sleep_ref,), {}))
-            raise TimeoutError(f"Timed out at deadline epoch {deadline}")
+            raise Timeout(f"Timed out at deadline epoch {deadline}", is_deadline=True)
 
 
 class Loop(Atom): ...
@@ -1069,13 +1075,15 @@ def run_experiment(
     spike_offset: int = 10000,
     spike_duration: int = 3000,
     submit_timeout: int = 30,
+    work_time_range: tuple[int, int] = (5, 20),
+    inter_task_sleep_range: tuple[int, int] = (10, 30),
 ):
     def make_worker(queue: Queue[tuple[Addr, Ref]]):
         @loop
         async def start():
             addr, ref = await queue.dequeue()
             log("start task", ref=ref)
-            await sleep(rng().randrange(5, 20))
+            await sleep(rng().randrange(*work_time_range))
             log("finish task", ref=ref)
             send(addr, ref, Ok, hint="task_finished")
 
@@ -1124,15 +1132,22 @@ def run_experiment(
     ) -> bool:
         submission_id = Ref()
         for try_num in range(n_retries):
+            if deadline is not None and now() >= deadline:
+                log(
+                    "deadline exceeded",
+                    deadline=deadline,
+                    try_num=try_num,
+                    submission_id=submission_id,
+                )
+                return False
             if timeout:
                 try:
                     result = await ask_timeout(
                         timeout,
                         lb_addr,
                         SubmitWork,
-                        deadline=deadline,
                     )
-                except TimeoutError:
+                except Timeout:
                     log(
                         "timeout",
                         after=timeout,
@@ -1146,8 +1161,6 @@ def run_experiment(
                 case Ok():
                     return True
                 case Err():
-                    if deadline and now() >= deadline:
-                        return False
                     await sleep(policy(try_num))
                     log("retry", try_num=try_num, submission_id=submission_id)
                 case _:
@@ -1163,43 +1176,59 @@ def run_experiment(
             deadline=deadline,
         )
         if success:
-            log("finished", latency=now() - start)
+            log("finished", latency=now() - start, start=start)
         else:
             log("failed", latency=now() - start)
 
     clients: list[StateMachineInit] = []
 
+    def make_normal_client(client_ix: int):
+        @launch
+        async def client():
+            log("client started", client_ix=client_ix)
+            while True:
+                await perform_work()
+                await sleep(rng().randrange(*inter_task_sleep_range))
+
+        return client
+
+    def make_spike_client(client_ix: int):
+        @launch
+        async def client():
+            await sleep(spike_offset + rng().randrange(0, 300))
+            log("client started", client_ix=client_ix)
+            while True:
+                await perform_work(
+                    deadline=spike_offset + spike_duration + rng().randrange(0, 300)
+                )
+                if now() >= spike_offset + spike_duration:
+                    break
+                await sleep(rng().randrange(*inter_task_sleep_range))
+            log("client exited", client_ix=client_ix)
+            self_node().stopped = True
+
+        return client
+
+    def make_added_client(client_ix: int):
+        @launch
+        async def client():
+            await sleep(spike_offset + rng().randrange(0, 300))
+            log("client started", client_ix=client_ix)
+            while True:
+                await perform_work()
+                await sleep(rng().randrange(*inter_task_sleep_range))
+
+        return client
+
     for client_ix in range(
         max(num_clients, num_clients_spike, num_clients_after_spike)
     ):
-
-        def make_client(client_ix: int):
-            @launch
-            async def client():
-                if client_ix > num_clients:
-                    await sleep(spike_offset)
-                log("client started", client_ix=client_ix)
-                while True:
-                    if (
-                        client_ix > num_clients_after_spike
-                        and now() >= spike_offset + spike_duration
-                    ):
-                        break
-                    # Ensure that outstanding requests are cancelled after the spike.
-                    # This is needed to correctly simulate clients exiting.
-                    deadline = (
-                        spike_offset + spike_duration + rng().randrange(0, 150)
-                        if now() < spike_offset + spike_duration
-                        and client_ix > num_clients_after_spike
-                        else None
-                    )
-                    await perform_work(deadline=deadline)
-                log("client exited", client_ix=client_ix)
-                self_node().stopped = True
-
-            return client
-
-        clients.append(make_client(client_ix))
+        if client_ix < num_clients:
+            clients.append(make_normal_client(client_ix))
+        elif client_ix < num_clients_after_spike:
+            clients.append(make_added_client(client_ix))
+        elif client_ix < num_clients_spike:
+            clients.append(make_spike_client(client_ix))
 
     event_loop = EventLoop()
     for i, queue_addr in enumerate(queue_addrs):
@@ -1237,7 +1266,7 @@ def analyze_result(result: RunResult):
         task_latency = [
             (t, lt)
             for t, lt in conn.execute(
-                "select epoch, data->>'latency' from log where msg='finished'"
+                "select data->>'start', data->>'latency' from log where msg='finished'"
             ).fetchall()
         ]
         latency_df = pl.DataFrame(task_latency, schema=["time", "value"], orient="row")
@@ -1275,43 +1304,21 @@ def analyze_result(result: RunResult):
         )
 
         successes = [
-            (t,)
+            t
             for (t,) in conn.execute(
                 "select epoch from log where msg='finished'"
             ).fetchall()
         ]
         failures = [
-            (t,)
+            t
             for (t,) in conn.execute(
                 "select epoch from log where msg='failed'"
             ).fetchall()
         ]
-        success_df = pl.DataFrame(successes, schema=["time"], orient="row")
-        failure_df = pl.DataFrame(failures, schema=["time"], orient="row")
-        success_counts = (
-            pl.DataFrame({"time": range(result.num_epochs)})
-            .join(
-                success_df.group_by("time")
-                .agg(pl.count())
-                .rename({"count": "successes"}),
-                on="time",
-                how="left",
-            )
-            .with_columns(pl.col("successes").fill_null(0))
-        )
-        failure_counts = (
-            pl.DataFrame({"time": range(result.num_epochs)})
-            .join(
-                failure_df.group_by("time")
-                .agg(pl.count())
-                .rename({"count": "failures"}),
-                on="time",
-                how="left",
-            )
-            .with_columns(pl.col("failures").fill_null(0))
-        )
-        total_successes = np.cumsum(success_counts["successes"])
-        total_failures = np.cumsum(failure_counts["failures"])
+        success_counts = np.bincount(successes, minlength=result.num_epochs)
+        failure_counts = np.bincount(failures, minlength=result.num_epochs)
+        total_successes = np.cumsum(success_counts)
+        total_failures = np.cumsum(failure_counts)
 
         df = pl.DataFrame(
             {
@@ -1387,17 +1394,23 @@ runner = Runner()
 @runner.trial([1])
 def client_load_spike(_):
     return analyze_result(
+        # 1/20 tps
+        # avg task latency = 6 * 20 = 120
+        # single req rate = 1/(120 + 5)
         run_experiment(
-            num_workers=10,
-            queue_size=30,
-            num_retries=500,
-            num_epochs=14_000,
-            spike_offset=4000,
-            spike_duration=3000,
-            num_clients=10,
-            num_clients_spike=50,
-            num_clients_after_spike=20,
-            submit_timeout=50,
+            num_workers=1,
+            queue_size=10,
+            num_retries=100_000,
+            num_epochs=24_000,
+            spike_offset=8000,
+            spike_duration=6000,
+            num_clients=3,
+            num_clients_spike=5,
+            num_clients_after_spike=3,
+            submit_timeout=120,
+            work_time_range=(33, 37),
+            inter_task_sleep_range=(28, 32),
+            retry_policy=constant_retry(0),
         )
     )
 

@@ -10,22 +10,22 @@ set grid
 set multiplot layout 3,2 title sprintf('Plot of {/"CMU Typewriter Text" %s}', file)
 set key top left
 
-set title 'Number of Clients over Time'
+set title 'Number of Clients'
 set xlabel 'time'
 set ylabel '#clients'
 plot file using 'time':'num_clients' with lines lw 2 title '#clients'
 
-set title 'Task Latency over Time'
-set xlabel 'time'
+set title 'Task Latency'
+set xlabel 'start time'
 set ylabel 'latency'
 plot file using 'time':'smoothed_task_latency' with lines lw 2 title 'task latency'
 
-set title 'Queue Size over Time'
+set title 'Queue Size'
 set xlabel 'time'
 set ylabel 'queue size'
 plot file using 'time':'smoothed_queue_size' with lines lw 2 title 'queue size'
 
-set title 'Completed Tasks over Time'
+set title 'Total Completed Tasks'
 set xlabel 'time'
 set ylabel '#completed tasks'
 plot file using 'time':'total_successes' with lines lw 2 title 'successes', \
