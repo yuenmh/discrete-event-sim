@@ -1102,11 +1102,13 @@ def run_experiment(
         queue: Addr
 
     lb_outstanding: dict[Ref, Outstanding] = {}
+    num_requests_sent = {addr: 0 for addr in queue_addrs}
 
     @load_balancer.branch_handler(SubmitWork)
     async def submit_work(sender: Addr, ref: Ref):
-        worker_queue_addr = rng().choice(queue_addrs)
+        worker_queue_addr = min(queue_addrs, key=lambda addr: num_requests_sent[addr])
         send(worker_queue_addr, Enqueue, self(), ref, (sender, ref))
+        num_requests_sent[worker_queue_addr] += 1
         lb_outstanding[ref] = Outstanding(
             sender=sender, ref=ref, queue=worker_queue_addr
         )
@@ -1422,15 +1424,15 @@ def multiple_servers(version: Literal["control", "test"]):
             num_workers=4,
             queue_size=10,
             num_retries=100_000,
-            num_epochs=40_000,
+            num_epochs=60_000,
             spike_offset=12000 if version == "test" else 100_000,
             spike_duration=2000,
             num_clients=12,
             num_clients_spike=20,
             num_clients_after_spike=12,
-            submit_timeout=100,
-            work_time_range=(26, 27),
-            inter_task_sleep_range=(42, 44),
+            submit_timeout=83,
+            work_time_range=(25, 27),
+            inter_task_sleep_range=(49, 52),
             retry_policy=constant_retry(2),
         )
     )
