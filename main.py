@@ -1391,28 +1391,27 @@ class Runner:
 runner = Runner()
 
 
-@runner.trial([1])
-def client_load_spike(_):
-    return analyze_result(
-        # 1/20 tps
-        # avg task latency = 6 * 20 = 120
-        # single req rate = 1/(120 + 5)
-        run_experiment(
-            num_workers=1,
-            queue_size=10,
-            num_retries=100_000,
-            num_epochs=24_000,
-            spike_offset=8000,
-            spike_duration=6000,
-            num_clients=3,
-            num_clients_spike=5,
-            num_clients_after_spike=3,
-            submit_timeout=120,
-            work_time_range=(33, 37),
-            inter_task_sleep_range=(28, 32),
-            retry_policy=constant_retry(0),
-        )
+def run_single_server_case(queue_size: int):
+    return run_experiment(
+        num_workers=1,
+        queue_size=queue_size,
+        num_retries=100_000,
+        num_epochs=40_000,
+        spike_offset=8000,
+        spike_duration=2000,
+        num_clients=3,
+        num_clients_spike=5,
+        num_clients_after_spike=3,
+        submit_timeout=83,
+        work_time_range=(25, 27),
+        inter_task_sleep_range=(49, 52),
+        retry_policy=constant_retry(2),
     )
+
+
+@runner.trial([1, 10])
+def single_server_vary_queue_size(qs):
+    return analyze_result(run_single_server_case(queue_size=qs))
 
 
 def main():

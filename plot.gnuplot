@@ -10,6 +10,8 @@ set grid
 set multiplot layout 3,2 title sprintf('Plot of {/"CMU Typewriter Text" %s}', file)
 set key top left
 
+set yrange [0:*]
+
 set title 'Number of Clients'
 set xlabel 'time'
 set ylabel '#clients'
