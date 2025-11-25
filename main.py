@@ -18,6 +18,7 @@ from typing import (
     Coroutine,
     Generator,
     Mapping,
+    NamedTuple,
     Protocol,
     Self,
     Sequence,
@@ -60,12 +61,20 @@ def _deterministic_uuid() -> UUID:
         return UUID(bytes=rng().randbytes(16))
 
 
+def created_by_default() -> Addr | None:
+    try:
+        return context().self_addr
+    except RuntimeError:
+        return None
+
+
 @dataclass(frozen=True, slots=True)
 class Ref:
     uuid: UUID = field(default_factory=_deterministic_uuid)
+    # created_by: Addr | None = field(default_factory=created_by_default)
 
     def __repr__(self) -> str:
-        return f"{type(self).__name__}({str(self.uuid)!r})"
+        return f"{type(self).__name__}({str(self.uuid)!r}"
 
 
 class _AtomMeta(type):
@@ -349,7 +358,9 @@ def handler[T](fn: Callable[..., T]) -> HandlerFn[T]:
     sig = inspect.signature(fn)
 
     def wrapped(msg: Message) -> T:
-        bound = sig.bind(*msg.args, **msg.kwargs)
+        bound = sig.bind(
+            *msg.args, **{k: v for k, v in msg.kwargs.items() if k in sig.parameters}
+        )
         result = fn(*bound.args, **bound.kwargs)
         return result
 
@@ -500,7 +511,7 @@ class Node:
         self.fuel_per_epoch: int | None = None
         self.unlimited_fuel = False
         self.stopped = False
-        self._detector = _LeakDetector(alpha=0.01, threshold=0.4)
+        self._detector = _LeakDetector(alpha=0.09, threshold=0.2)
         self._addr = None
 
     def run(
@@ -529,6 +540,7 @@ class Node:
         self._detector.update(len(self.inbox))
         if self._detector.is_leaking():
             warnings.warn(f"{self._addr} inbox growing. size={len(self.inbox)}")
+            print(self.inbox)
 
     def deliver(self, msg: Message):
         if self.stopped:
@@ -836,7 +848,7 @@ class TimerSpec:
                 ]
                 for ref in to_wake:
                     sender, _ = waiting_tasks.pop(ref)
-                    send(sender, ref)
+                    send(sender, ref, hint="wake")
 
         return initialize(timer, message(Loop))
 
@@ -942,7 +954,7 @@ def make_queue(max_size: int = 10) -> StateMachineInit:
     queue = SMBuilder()
 
     def log_size():
-        log(size=len(items))
+        log("queue size", size=len(items))
 
     @queue.branch_handler(Enqueue)
     async def enqueue(sender: Addr, ref: Ref, item: Any):
@@ -953,7 +965,7 @@ def make_queue(max_size: int = 10) -> StateMachineInit:
             while waiting and items:
                 send(*waiting.pop(0), items.pop(0))
             log_size()
-            send(sender, ref, Ok)
+            send(sender, ref, Ok, hint="enqueued")
 
     @queue.branch_handler(Dequeue)
     async def dequeue(sender: Addr, ref: Ref):
@@ -1056,6 +1068,7 @@ def run_experiment(
     retry_policy: Callable[[int], int] = constant_retry(20),
     spike_offset: int = 10000,
     spike_duration: int = 3000,
+    submit_timeout: int = 30,
 ):
     def make_worker(queue: Queue[tuple[Addr, Ref]]):
         @loop
@@ -1064,7 +1077,7 @@ def run_experiment(
             log("start task", ref=ref)
             await sleep(rng().randrange(5, 20))
             log("finish task", ref=ref)
-            send(addr, ref, Ok)
+            send(addr, ref, Ok, hint="task_finished")
 
         return start
 
@@ -1074,14 +1087,32 @@ def run_experiment(
 
     class SubmitWork(Atom): ...
 
+    class Outstanding(NamedTuple):
+        sender: Addr
+        ref: Ref
+        queue: Addr
+
+    lb_outstanding: dict[Ref, Outstanding] = {}
+
     @load_balancer.branch_handler(SubmitWork)
     async def submit_work(sender: Addr, ref: Ref):
         worker_queue_addr = rng().choice(queue_addrs)
-        if await ask(worker_queue_addr, Enqueue, (sender, ref)) is QueueFull:
-            log("queue full", queue=worker_queue_addr)
-            send(sender, ref, Err)
-        else:
-            send(sender, ref, Ok)
+        send(worker_queue_addr, Enqueue, self(), ref, (sender, ref))
+        lb_outstanding[ref] = Outstanding(
+            sender=sender, ref=ref, queue=worker_queue_addr
+        )
+
+    @load_balancer.branch_handler(..., QueueFull)
+    async def handle_queue_full(ref: Ref):
+        outstanding = lb_outstanding.pop(ref, None)
+        assert outstanding is not None, "Received QueueFull for unknown submission"
+        log("queue full", queue=outstanding.queue)
+        send(outstanding.sender, outstanding.ref, Err, hint="work_failed")
+
+    @load_balancer.branch_handler(..., Ok)
+    async def handle_ok(ref: Ref):
+        outstanding = lb_outstanding.pop(ref, None)
+        assert outstanding is not None, "Received Ok for unknown submission"
 
     lb_addr = Addr("load_balancer")
 
@@ -1115,6 +1146,8 @@ def run_experiment(
                 case Ok():
                     return True
                 case Err():
+                    if deadline and now() >= deadline:
+                        return False
                     await sleep(policy(try_num))
                     log("retry", try_num=try_num, submission_id=submission_id)
                 case _:
@@ -1125,7 +1158,7 @@ def run_experiment(
         start = now()
         success = await submit_work_wrapper(
             n_retries=num_retries,
-            timeout=100,
+            timeout=submit_timeout,
             policy=retry_policy,
             deadline=deadline,
         )
@@ -1145,19 +1178,19 @@ def run_experiment(
             async def client():
                 if client_ix > num_clients:
                     await sleep(spike_offset)
-                start_time = now()
                 log("client started", client_ix=client_ix)
                 while True:
                     if (
                         client_ix > num_clients_after_spike
-                        and now() - start_time > spike_duration
+                        and now() >= spike_offset + spike_duration
                     ):
                         break
                     # Ensure that outstanding requests are cancelled after the spike.
                     # This is needed to correctly simulate clients exiting.
                     deadline = (
-                        spike_offset + spike_duration
+                        spike_offset + spike_duration + rng().randrange(0, 150)
                         if now() < spike_offset + spike_duration
+                        and client_ix > num_clients_after_spike
                         else None
                     )
                     await perform_work(deadline=deadline)
@@ -1215,11 +1248,81 @@ def analyze_result(result: RunResult):
             .with_columns(pl.col("value").forward_fill().fill_null(0))
         )
 
+        smoothing_window = 300
+        smoothed_latency = np.convolve(
+            latency_result_df["value"].to_numpy(),
+            np.ones(smoothing_window) / smoothing_window,
+            mode="same",
+        )
+
+        queue_size = [
+            (t, sz)
+            for t, sz in conn.execute(
+                "select epoch, data->>'size' from log where msg='queue size'"
+            ).fetchall()
+        ]
+        queue_size_df = pl.DataFrame(queue_size, schema=["time", "value"], orient="row")
+        averages = queue_size_df.group_by("time").agg(pl.col("value").mean())
+        queue_size_result_df = (
+            pl.DataFrame({"time": range(result.num_epochs)})
+            .join(averages, on="time", how="left")
+            .with_columns(pl.col("value").forward_fill().fill_null(0))
+        )
+        smoothed_queue_size = np.convolve(
+            queue_size_result_df["value"].to_numpy(),
+            np.ones(smoothing_window) / smoothing_window,
+            mode="same",
+        )
+
+        successes = [
+            (t,)
+            for (t,) in conn.execute(
+                "select epoch from log where msg='finished'"
+            ).fetchall()
+        ]
+        failures = [
+            (t,)
+            for (t,) in conn.execute(
+                "select epoch from log where msg='failed'"
+            ).fetchall()
+        ]
+        success_df = pl.DataFrame(successes, schema=["time"], orient="row")
+        failure_df = pl.DataFrame(failures, schema=["time"], orient="row")
+        success_counts = (
+            pl.DataFrame({"time": range(result.num_epochs)})
+            .join(
+                success_df.group_by("time")
+                .agg(pl.count())
+                .rename({"count": "successes"}),
+                on="time",
+                how="left",
+            )
+            .with_columns(pl.col("successes").fill_null(0))
+        )
+        failure_counts = (
+            pl.DataFrame({"time": range(result.num_epochs)})
+            .join(
+                failure_df.group_by("time")
+                .agg(pl.count())
+                .rename({"count": "failures"}),
+                on="time",
+                how="left",
+            )
+            .with_columns(pl.col("failures").fill_null(0))
+        )
+        total_successes = np.cumsum(success_counts["successes"])
+        total_failures = np.cumsum(failure_counts["failures"])
+
         df = pl.DataFrame(
             {
                 "time": range(result.num_epochs),
                 "num_clients": num_clients,
                 "task_latency": latency_result_df["value"],
+                "smoothed_task_latency": smoothed_latency,
+                "queue_size": queue_size_result_df["value"],
+                "smoothed_queue_size": smoothed_queue_size,
+                "total_successes": total_successes,
+                "total_failures": total_failures,
             }
         )
         return df
@@ -1285,7 +1388,16 @@ runner = Runner()
 def client_load_spike(_):
     return analyze_result(
         run_experiment(
-            num_retries=1, num_epochs=15000, spike_offset=5000, spike_duration=2000
+            num_workers=10,
+            queue_size=30,
+            num_retries=500,
+            num_epochs=14_000,
+            spike_offset=4000,
+            spike_duration=3000,
+            num_clients=10,
+            num_clients_spike=50,
+            num_clients_after_spike=20,
+            submit_timeout=50,
         )
     )
 
