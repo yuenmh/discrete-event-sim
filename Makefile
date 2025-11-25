@@ -1,7 +1,8 @@
 CSVS=$(wildcard results/*.csv)
 PLOTS=$(patsubst results/%.csv,plots/%.png,$(CSVS))
+SCRIPT=plot.gnuplot
 
-plots: $(PLOTS)
+plots: $(SCRIPT) $(PLOTS)
 
 plots/%.png: results/%.csv
-	gnuplot -c plot.gnuplot $< $@
+	gnuplot -c $(SCRIPT) $< $@

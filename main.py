@@ -10,7 +10,6 @@ import warnings
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, field, replace
-from operator import itemgetter
 from random import Random
 from typing import (
     Any,
@@ -640,6 +639,7 @@ class EventLoop:
                     break
 
             self.epoch += 1
+            print(self.epoch)
             self.commit_logs()
 
         return RunResult(logs=self.logs, num_epochs=self.epoch)
@@ -718,19 +718,34 @@ class _FusedRefSelect:
 
 
 async def ask_timeout(
-    timeout: int, addr: Addr, method: Any, *args: Any, **kwargs: Any
+    timeout: int,
+    addr: Addr,
+    method: Any,
+    *args: Any,
+    deadline: int | None = None,
 ) -> Any:
     result_ref = Ref()
-    send(addr, method, self(), result_ref, *args, **kwargs)
+    send(addr, method, self(), result_ref, *args)
     sleep_ref = Ref()
     send(_TIMER_ADDR, Sleep, self(), sleep_ref, timeout)
-    result, msg = await _wait_inner(_FusedRefSelect((result_ref, sleep_ref)))
+    deadline_ref = Ref()
+    if deadline is not None:
+        send(_TIMER_ADDR, SleepUntil, self(), sleep_ref, deadline)
+    result, msg = await _wait_inner(
+        _FusedRefSelect((result_ref, sleep_ref, deadline_ref))
+    )
     if result.branch_id == 0:
         self_node().set_drop_hint(SingleMatcher((sleep_ref,), {}))
+        self_node().set_drop_hint(SingleMatcher((deadline_ref,), {}))
         return msg.args[1]
     else:
         self_node().set_drop_hint(SingleMatcher((result_ref,), {}))
-        raise TimeoutError(f"Timed out after {timeout} epochs")
+        if result.branch_id == 1:
+            self_node().set_drop_hint(SingleMatcher((deadline_ref,), {}))
+            raise TimeoutError(f"Timed out after {timeout} epochs")
+        else:
+            self_node().set_drop_hint(SingleMatcher((sleep_ref,), {}))
+            raise TimeoutError(f"Timed out at deadline epoch {deadline}")
 
 
 class Loop(Atom): ...
@@ -739,11 +754,18 @@ class Loop(Atom): ...
 class Sleep(Atom): ...
 
 
+class SleepUntil(Atom): ...
+
+
 _TIMER_ADDR = Addr("__internal.timer")
 
 
 def sleep(duration: int):
     return ask(_TIMER_ADDR, Sleep, duration)
+
+
+def sleep_until(deadline: int):
+    return ask(_TIMER_ADDR, SleepUntil, deadline)
 
 
 class NodeSpec(Protocol):
@@ -762,6 +784,14 @@ class TimerSpec:
             @async_branch_handler(Sleep)
             async def sleep(sender: Addr, ref: Ref, duration: int):
                 wake_time = now() + duration
+                waiting_tasks[ref] = (sender, wake_time)
+
+            @async_branch_handler(SleepUntil)
+            async def sleep_until(sender: Addr, ref: Ref, until: int):
+                if until <= now():
+                    send(sender, ref)
+                    return
+                wake_time = until
                 waiting_tasks[ref] = (sender, wake_time)
 
             @async_branch_handler(Loop)
@@ -987,11 +1017,15 @@ def constant_retry(sleep_time: int):
 
 def run_experiment(
     num_clients: int = 10,
+    num_clients_spike: int = 50,
+    num_clients_after_spike: int = 30,
     num_workers: int = 4,
     queue_size: int = 14,
-    num_epochs: int = 20000,
+    num_epochs: int = 30000,
     num_retries: int = 3,
     retry_policy: Callable[[int], int] = constant_retry(20),
+    spike_offset: int = 10000,
+    spike_duration: int = 3000,
 ):
     def make_worker(queue: Queue[tuple[Addr, Ref]]):
         @loop
@@ -1028,7 +1062,12 @@ def run_experiment(
         for try_num in range(n_retries):
             if timeout:
                 try:
-                    result = await ask_timeout(timeout, lb_addr, SubmitWork)
+                    result = await ask_timeout(
+                        timeout,
+                        lb_addr,
+                        SubmitWork,
+                        deadline=spike_offset + spike_duration,
+                    )
                 except TimeoutError:
                     log(
                         "timeout",
@@ -1063,15 +1102,29 @@ def run_experiment(
 
     clients: list[StateMachineInit] = []
 
-    for _ in range(num_clients):
+    for client_ix in range(
+        max(num_clients, num_clients_spike, num_clients_after_spike)
+    ):
 
-        @launch
-        async def client():
-            for _ in range(50):
-                await perform_work()
-            log("exited")
+        def make_client(client_ix: int):
+            @launch
+            async def client():
+                if client_ix > num_clients:
+                    await sleep(spike_offset)
+                start_time = now()
+                log("client started", client_ix=client_ix)
+                while True:
+                    if (
+                        client_ix > num_clients_after_spike
+                        and now() - start_time > spike_duration
+                    ):
+                        break
+                    await perform_work()
+                log("client exited", client_ix=client_ix)
 
-        clients.append(client)
+            return client
+
+        clients.append(make_client(client_ix))
 
     event_loop = EventLoop()
     for i, queue_addr in enumerate(queue_addrs):
@@ -1081,45 +1134,53 @@ def run_experiment(
     for i, client in enumerate(clients):
         event_loop.spawn(Addr(f"client-{i}"), client)
 
-    condition = StopAfterNodesExited([Addr(f"client-{i}") for i in range(num_clients)])
-    result = event_loop.run(epochs=num_epochs, condition=condition)
+    result = event_loop.run(epochs=num_epochs)
     return result
 
 
 def analyze_result(result: RunResult):
-    with result.logs_sqlite() as conn:
-        size = [
-            x
-            for (x,) in conn.execute(
-                "select data->>'size' from log where addr like 'queue-%'"
-            ).fetchall()
-        ]
-        latency = [
-            x
-            for (x,) in conn.execute(
-                "select data->>'latency' from log where addr like 'client-%' and msg='finished'"
-            ).fetchall()
-        ]
-        failed_latency = [
-            x
-            for (x,) in conn.execute(
-                "select data->>'latency' from log where addr like 'client-%' and msg='failed'"
-            ).fetchall()
-        ]
+    import numpy as np
+    import polars as pl
 
-        datum = {
-            "num_epochs": result.num_epochs,
-            "queue_size_mean": sum(size) / len(size),
-            "queue_size_max": max(size),
-            "queue_size_min": min(size),
-            "latency_mean": sum(latency) / len(latency),
-            "latency_max": max(latency),
-            "latency_min": min(latency),
-            "tasks_total": len(latency) + len(failed_latency),
-            "tasks_failed": len(failed_latency),
-            "fail_rate": len(failed_latency) / (len(latency) + len(failed_latency)),
-        }
-        return datum
+    with result.logs_sqlite() as conn:
+        client_starts = [
+            t
+            for (t,) in conn.execute(
+                "select epoch from log where msg='client started'"
+            ).fetchall()
+        ]
+        client_stops = [
+            t
+            for (t,) in conn.execute(
+                "select epoch from log where msg='client exited'"
+            ).fetchall()
+        ]
+        start_counts = np.bincount(client_starts, minlength=result.num_epochs)
+        stop_counts = np.bincount(client_stops, minlength=result.num_epochs)
+        num_clients = np.cumsum(start_counts - stop_counts)
+
+        task_latency = [
+            (t, lt)
+            for t, lt in conn.execute(
+                "select epoch, data->>'latency' from log where msg='finished'"
+            ).fetchall()
+        ]
+        latency_df = pl.DataFrame(task_latency, schema=["time", "value"], orient="row")
+        averages = latency_df.group_by("time").agg(pl.col("value").mean())
+        latency_result_df = (
+            pl.DataFrame({"time": range(result.num_epochs)})
+            .join(averages, on="time", how="left")
+            .with_columns(pl.col("value").forward_fill().fill_null(0))
+        )
+
+        df = pl.DataFrame(
+            {
+                "time": range(result.num_epochs),
+                "num_clients": num_clients,
+                "task_latency": latency_result_df["value"],
+            }
+        )
+        return df
 
 
 def write_csv(path: str, data: list[dict]):
@@ -1141,57 +1202,54 @@ class Runner:
 
         return decorator
 
-    def run_all(self):
+    def _runner_fn(self, args: tuple[str, Callable[..., Any], Any, str]):
+        import polars as pl
+
+        _name, fn, input, output_path = args
+        result = fn(input)
+        if isinstance(result, pl.DataFrame):
+            result.write_csv(output_path, include_header=True)
+        elif isinstance(result, list):
+            write_csv(output_path, result)
+        else:
+            raise TypeError("Unsupported result type")
+
+    def run_all(self, force: bool = False, concurrent: bool = True):
+        runs = []
         for name, fn, inputs in self.runs:
-            output_path = f"results/{name}.csv"
-            if os.path.exists(output_path):
-                print(f"Skip {name} (already exists)")
-                continue
+            for input in inputs:
+                output_path = f"results/{name}-{input}.csv"
+                if os.path.exists(output_path) and not force:
+                    print(f"Skip {name} with input {input} (already exists)")
+                    continue
+                runs.append((name, fn, input, output_path))
 
-            print(f"Run {name}")
+        print("To run")
+        for name, *_ in runs:
+            print(f"  {name}")
 
+        if concurrent:
             pool = multiprocessing.Pool()
-            result = pool.imap_unordered(fn, inputs)
-            data = list(tqdm(result, total=len(inputs)))
-            data.sort(key=itemgetter(0))
-            data = [datum for _, datum in data]
-
-            write_csv(output_path, data)
+            list(tqdm(pool.imap_unordered(self._runner_fn, runs), total=len(runs)))
+        else:
+            for run in tqdm(runs):
+                self._runner_fn(run)
 
 
 runner = Runner()
 
 
-@runner.trial(list(range(1, 40, 1)))
-def queue_size_01(num_clients: int):
-    result = run_experiment(num_clients=num_clients, queue_size=1)
-    datum = analyze_result(result)
-    return num_clients, {"num_clients": num_clients, **datum}
-
-
-@runner.trial(list(range(1, 40, 1)))
-def queue_size_06(num_clients: int):
-    result = run_experiment(num_clients=num_clients, queue_size=6)
-    datum = analyze_result(result)
-    return num_clients, {"num_clients": num_clients, **datum}
-
-
-@runner.trial(list(range(1, 40, 1)))
-def queue_size_12(num_clients: int):
-    result = run_experiment(num_clients=num_clients, queue_size=12)
-    datum = analyze_result(result)
-    return num_clients, {"num_clients": num_clients, **datum}
-
-
-@runner.trial(list(range(1, 40, 1)))
-def no_retries(num_clients: int):
-    result = run_experiment(num_clients=num_clients, queue_size=12, num_retries=1)
-    datum = analyze_result(result)
-    return num_clients, {"num_clients": num_clients, **datum}
+@runner.trial([1])
+def client_load_spike(_):
+    return analyze_result(
+        run_experiment(
+            num_retries=1, num_epochs=15000, spike_offset=5000, spike_duration=2000
+        )
+    )
 
 
 def main():
-    runner.run_all()
+    runner.run_all(force=True, concurrent=False)
 
 
 if __name__ == "__main__":
