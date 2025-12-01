@@ -1,7 +1,6 @@
 import csv
 import multiprocessing
 import os
-from dataclasses import dataclass
 from typing import (
     Any,
     Callable,
@@ -23,8 +22,6 @@ from des.sim import (
     Timeout,
     ask,
     ask_timeout,
-    async_branch_handler,
-    build_state_machine,
     launch,
     log,
     loop,
@@ -35,167 +32,7 @@ from des.sim import (
     send,
     sleep,
 )
-
-
-def test_simple():
-    class Add(Atom): ...
-
-    def make_adder():
-        with build_state_machine() as adder:
-
-            @async_branch_handler(Add)
-            async def add(sender: Addr, ref: Ref, a: int, b: int):
-                send(sender, ref, a + b)
-
-        return adder
-
-    def make_main(adder: Addr):
-        @dataclass
-        class State:
-            i: int = 0
-
-        state = State()
-
-        @loop
-        async def main():
-            result = await ask(adder, Add, state.i, 10)
-            log(result=result)
-
-            state.i += 1
-
-        return main
-
-    adder_addr = Addr("adder")
-
-    event_loop = EventLoop()
-    event_loop.spawn(adder_addr, make_adder())
-    event_loop.spawn(Addr("main"), make_main(adder_addr))
-    event_loop.run(epochs=50)
-
-    for entry in event_loop.logs:
-        print(entry)
-
-    values = [entry.data["result"] for entry in event_loop.logs]
-    for i in range(10, 20):
-        assert i in values
-
-
-class Enqueue(Atom): ...
-
-
-class Dequeue(Atom): ...
-
-
-class QueueFull(Atom): ...
-
-
-class Ok(Atom): ...
-
-
-class Err(Atom): ...
-
-
-def make_queue(max_size: int = 10) -> StateMachineInit:
-    items = []
-    waiting: list[tuple[Addr, Ref]] = []
-
-    queue = SMBuilder()
-
-    def log_size():
-        log("queue size", size=len(items))
-
-    @queue.branch_handler(Enqueue)
-    async def enqueue(sender: Addr, ref: Ref, item: Any):
-        if len(items) >= max_size:
-            send(sender, ref, QueueFull)
-        else:
-            items.append(item)
-            while waiting and items:
-                send(*waiting.pop(0), items.pop(0))
-            log_size()
-            send(sender, ref, Ok, hint="enqueued")
-
-    @queue.branch_handler(Dequeue)
-    async def dequeue(sender: Addr, ref: Ref):
-        if items:
-            send(sender, ref, items.pop(0))
-            log_size()
-        else:
-            waiting.append((sender, ref))
-
-    return queue
-
-
-@dataclass
-class Queue[T]:
-    addr: Addr
-
-    async def enqueue(self, item: T) -> bool:
-        result = await ask(self.addr, Enqueue, item)
-        return result is not QueueFull
-
-    async def dequeue(self) -> T:
-        return await ask(self.addr, Dequeue)
-
-
-def test_producer_consumer():
-    def make_consumer(queue: Queue[int]):
-        @launch
-        async def start():
-            while True:
-                item = await queue.dequeue()
-                log(dequeued=item)
-
-        return start
-
-    def make_producer(queue: Queue[int]):
-        @launch
-        async def start():
-            await sleep(20)
-            for i in range(20):
-                await queue.enqueue(i)
-                log(enqueued=i)
-
-        return start
-
-    queue_addr = Addr("queue")
-
-    event_loop = EventLoop()
-    event_loop.spawn(queue_addr, make_queue(max_size=30))
-    event_loop.spawn(Addr("producer"), make_producer(Queue(queue_addr)))
-    event_loop.spawn(Addr("consumer"), make_consumer(Queue(queue_addr)))
-
-    event_loop.run(epochs=100)
-
-    for entry in event_loop.logs:
-        print(entry)
-
-    dequeued = set(
-        entry.data["dequeued"] for entry in event_loop.logs if "dequeued" in entry.data
-    )
-    assert dequeued == set(range(20))
-
-
-def test_timeout():
-    @loop
-    async def do_nothing():
-        await sleep(200)
-
-    @launch
-    async def main():
-        try:
-            await ask_timeout(10, Addr("do_nothing"), None)
-        except TimeoutError:
-            log("timed out")
-
-    event_loop = EventLoop()
-    event_loop.spawn(Addr("do_nothing"), do_nothing)
-    event_loop.spawn(Addr("main"), main)
-    event_loop.run(epochs=50)
-
-    assert any(
-        log.msg == "timed out" for log in event_loop.logs if log.addr.name == "main"
-    )
+from des.stdlib import Err, Ok, Queue
 
 
 def constant_retry(sleep_time: int):
@@ -248,13 +85,13 @@ def run_experiment(
     @load_balancer.branch_handler(SubmitWork)
     async def submit_work(sender: Addr, ref: Ref):
         worker_queue_addr = min(queue_addrs, key=lambda addr: num_requests_sent[addr])
-        send(worker_queue_addr, Enqueue, self(), ref, (sender, ref))
+        send(worker_queue_addr, Queue.Enqueue, self(), ref, (sender, ref))
         num_requests_sent[worker_queue_addr] += 1
         lb_outstanding[ref] = Outstanding(
             sender=sender, ref=ref, queue=worker_queue_addr
         )
 
-    @load_balancer.branch_handler(..., QueueFull)
+    @load_balancer.branch_handler(..., Queue.Full)
     async def handle_queue_full(ref: Ref):
         outstanding = lb_outstanding.pop(ref, None)
         assert outstanding is not None, "Received QueueFull for unknown submission"
@@ -376,7 +213,7 @@ def run_experiment(
 
     event_loop = EventLoop()
     for i, queue_addr in enumerate(queue_addrs):
-        event_loop.spawn(queue_addr, make_queue(max_size=queue_size))
+        event_loop.spawn(queue_addr, Queue.create(max_size=queue_size))
         event_loop.spawn(Addr(f"worker-{i}"), make_worker(Queue(queue_addr)))
     event_loop.spawn(lb_addr, load_balancer)
     for i, client in enumerate(clients):
@@ -580,7 +417,7 @@ def multiple_servers(version: Literal["control", "test"]):
 
 
 def main():
-    runner.run_all(force=False, concurrent=True)
+    runner.run_all(force=True, concurrent=True)
 
 
 if __name__ == "__main__":
