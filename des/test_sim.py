@@ -23,7 +23,7 @@ def test_simple():
     def make_adder():
         adder = SMBuilder()
 
-        @adder.branch_handler(Add)
+        @adder.handle(Add)
         async def add(sender: Addr, ref: Ref, a: int, b: int):
             send(sender, ref, a + b)
 

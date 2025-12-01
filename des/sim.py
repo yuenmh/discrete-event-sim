@@ -336,7 +336,7 @@ class SMBuilder(NoOpInit):
     def add_branch(self, matcher: Matcher, transition: SMBuilderTransition):
         self.branches.append((matcher, transition))
 
-    def branch_handler(self, *match_args: Any, **match_kwargs: Any):
+    def handle(self, *match_args: Any, **match_kwargs: Any):
         def decorator(fn: Callable[..., SMCoroutine] | Callable[..., StateMachine]):
             if inspect.iscoroutinefunction(fn):
                 self.add_branch(
@@ -760,12 +760,12 @@ class TimerSpec:
 
         timer = SMBuilder()
 
-        @timer.branch_handler(Sleep)
+        @timer.handle(Sleep)
         async def sleep(sender: Addr, ref: Ref, duration: int):
             wake_time = now() + duration
             waiting_tasks[ref] = (sender, wake_time)
 
-        @timer.branch_handler(SleepUntil)
+        @timer.handle(SleepUntil)
         async def sleep_until(sender: Addr, ref: Ref, until: int):
             if until <= now():
                 send(sender, ref)
@@ -773,7 +773,7 @@ class TimerSpec:
             wake_time = until
             waiting_tasks[ref] = (sender, wake_time)
 
-        @timer.branch_handler(Loop)
+        @timer.handle(Loop)
         async def loop():
             send(self(), Loop)
 
@@ -808,7 +808,7 @@ def responder(fn: ResponderFn):
 def loop(fn: Callable[..., Awaitable[None]]) -> StateMachineInit:
     sm = SMBuilder()
 
-    @sm.branch_handler(Loop)
+    @sm.handle(Loop)
     async def start():
         send(self(), Loop)
         await fn()
@@ -819,7 +819,7 @@ def loop(fn: Callable[..., Awaitable[None]]) -> StateMachineInit:
 def launch(fn: Callable[..., Awaitable[None]]) -> StateMachineInit:
     sm = SMBuilder()
 
-    @sm.branch_handler(None)
+    @sm.handle(None)
     async def start():
         await fn()
 

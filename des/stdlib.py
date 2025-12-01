@@ -39,7 +39,7 @@ class Queue[T]:
         def log_size():
             log("queue size", size=len(items))
 
-        @queue.branch_handler(Queue.Enqueue)
+        @queue.handle(Queue.Enqueue)
         async def enqueue(sender: Addr, ref: Ref, item: Any):
             if len(items) >= max_size:
                 send(sender, ref, Queue.Full)
@@ -50,7 +50,7 @@ class Queue[T]:
                 log_size()
                 send(sender, ref, Ok, hint="enqueued")
 
-        @queue.branch_handler(Queue.Dequeue)
+        @queue.handle(Queue.Dequeue)
         async def dequeue(sender: Addr, ref: Ref):
             if items:
                 send(sender, ref, items.pop(0))

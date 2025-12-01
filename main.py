@@ -82,7 +82,7 @@ def run_experiment(
     lb_outstanding: dict[Ref, Outstanding] = {}
     num_requests_sent = {addr: 0 for addr in queue_addrs}
 
-    @load_balancer.branch_handler(SubmitWork)
+    @load_balancer.handle(SubmitWork)
     async def submit_work(sender: Addr, ref: Ref):
         worker_queue_addr = min(queue_addrs, key=lambda addr: num_requests_sent[addr])
         send(worker_queue_addr, Queue.Enqueue, self(), ref, (sender, ref))
@@ -91,14 +91,14 @@ def run_experiment(
             sender=sender, ref=ref, queue=worker_queue_addr
         )
 
-    @load_balancer.branch_handler(..., Queue.Full)
+    @load_balancer.handle(..., Queue.Full)
     async def handle_queue_full(ref: Ref):
         outstanding = lb_outstanding.pop(ref, None)
         assert outstanding is not None, "Received QueueFull for unknown submission"
         log("queue full", queue=outstanding.queue)
         send(outstanding.sender, outstanding.ref, Err, hint="work_failed")
 
-    @load_balancer.branch_handler(..., Ok)
+    @load_balancer.handle(..., Ok)
     async def handle_ok(ref: Ref):
         outstanding = lb_outstanding.pop(ref, None)
         assert outstanding is not None, "Received Ok for unknown submission"
