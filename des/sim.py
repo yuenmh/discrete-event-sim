@@ -39,7 +39,7 @@ __all__ = [
     "launch",
     "send",
     "self",
-    "self_node",
+    "_self_node",
     "wait",
     "log",
     "now",
@@ -627,7 +627,7 @@ def self() -> Addr:
     return context().self_addr
 
 
-def self_node() -> Node:
+def _self_node() -> Node:
     return context().event_loop.nodes[context().self_addr]
 
 
@@ -649,7 +649,7 @@ async def _race_refs(*refs: Ref):
     result, message = await _wait_inner(_FusedRefSelect(refs))
     dropped = [ref for i, ref in enumerate(refs) if i != result.branch_id]
     for ref in dropped:
-        self_node().set_drop_hint(_FusedRefSelect((ref,)))
+        _self_node().set_drop_hint(_FusedRefSelect((ref,)))
     return message
 
 
@@ -672,6 +672,10 @@ async def ask(addr: Addr, method: Any, *args: Any, **kwargs: Any) -> Any:
     send(addr, method, self(), ref, *args, **kwargs)
     result, *_ = await wait(ref)
     return result
+
+
+def stop():
+    _self_node().stopped = True
 
 
 class _FusedRefSelect:

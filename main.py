@@ -28,9 +28,9 @@ from des.sim import (
     now,
     rng,
     self,
-    self_node,
     send,
     sleep,
+    stop,
 )
 from des.stdlib import Err, Ok, Queue
 
@@ -186,7 +186,7 @@ def run_experiment(
                     break
                 await sleep(rng().randrange(*inter_task_sleep_range))
             log("client exited", client_ix=client_ix)
-            self_node().stopped = True
+            stop()
 
         return client
 
