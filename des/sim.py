@@ -1,4 +1,3 @@
-import functools
 import hashlib
 import inspect
 import sqlite3
@@ -35,8 +34,6 @@ __all__ = [
     "SMBuilder",
     "StateMachine",
     "StateMachineInit",
-    "build_state_machine",
-    "async_branch_handler",
     "EventLoop",
     "loop",
     "launch",
@@ -412,99 +409,6 @@ def async_transition(continuation: StateMachine):
     return decorator
 
 
-_builder_var = ContextVar[SMBuilder | None]("builder")
-
-
-def _builder() -> SMBuilder:
-    builder = _builder_var.get()
-    if builder is None:
-        raise RuntimeError("_builder() called outside of build_state_machine context")
-    return builder
-
-
-@contextmanager
-def build_state_machine() -> Generator[StateMachine]:
-    builder = SMBuilder()
-    token = _builder_var.set(builder)
-    try:
-        yield builder
-    finally:
-        _builder_var.reset(token)
-
-
-def branch(*match_args: Any, **match_kwargs: Any):
-    def decorator(fn: HandlerFn[StateMachine]):
-        _builder().add_branch(
-            matcher=SingleMatcher(match_args, match_kwargs), transition=fn
-        )
-
-    return decorator
-
-
-def async_branch_handler(*match_args: Any, **match_kwargs: Any):
-    """Equivalent to the following:
-
-    ```python
-    with build_state_machine() as sm:
-        @branch(*match_args, **match_kwargs)
-        @async_transition(continuation=sm)
-        @handler
-        async def handle():
-            ...
-    ```
-    """
-
-    def decorator(fn: Callable[..., SMCoroutine]):
-        @branch(*match_args, **match_kwargs)
-        @async_transition(continuation=_builder())
-        @handler
-        @functools.wraps(fn)
-        def handle(*args: Any, **kwargs: Any) -> SMCoroutine:
-            return fn(*args, **kwargs)
-
-    return decorator
-
-
-def branch_handler(*match_args: Any, **match_kwargs: Any):
-    """Equivalent to the following:
-
-    ```python
-    with build_state_machine() as sm:
-        @branch(*match_args, **match_kwargs)
-        @handler
-        def handle():
-            ...
-    ```
-    """
-
-    def decorator(fn: Callable[..., StateMachine]):
-        branch(*match_args, **match_kwargs)(handler(fn))
-
-    return decorator
-
-
-with build_state_machine() as sm:
-
-    @branch()
-    @handler
-    def init():
-        return sm
-
-    @branch_handler()
-    def init_2():
-        return sm
-
-    @branch()
-    @async_transition(continuation=sm)
-    @handler
-    async def start():
-        pass
-
-    @async_branch_handler()
-    async def handle():
-        pass
-
-
 @dataclass
 class ContextImpl:
     event_loop: EventLoop
@@ -852,35 +756,36 @@ class TimerSpec:
     addr = _TIMER_ADDR
 
     def init(_self):
-        with build_state_machine() as timer:
-            waiting_tasks: dict[Ref, tuple[Addr, int]] = {}
+        waiting_tasks: dict[Ref, tuple[Addr, int]] = {}
 
-            @async_branch_handler(Sleep)
-            async def sleep(sender: Addr, ref: Ref, duration: int):
-                wake_time = now() + duration
-                waiting_tasks[ref] = (sender, wake_time)
+        timer = SMBuilder()
 
-            @async_branch_handler(SleepUntil)
-            async def sleep_until(sender: Addr, ref: Ref, until: int):
-                if until <= now():
-                    send(sender, ref)
-                    return
-                wake_time = until
-                waiting_tasks[ref] = (sender, wake_time)
+        @timer.branch_handler(Sleep)
+        async def sleep(sender: Addr, ref: Ref, duration: int):
+            wake_time = now() + duration
+            waiting_tasks[ref] = (sender, wake_time)
 
-            @async_branch_handler(Loop)
-            async def loop():
-                send(self(), Loop)
+        @timer.branch_handler(SleepUntil)
+        async def sleep_until(sender: Addr, ref: Ref, until: int):
+            if until <= now():
+                send(sender, ref)
+                return
+            wake_time = until
+            waiting_tasks[ref] = (sender, wake_time)
 
-                current_time = now()
-                to_wake = [
-                    ref
-                    for ref, (_, wake_time) in waiting_tasks.items()
-                    if wake_time <= current_time
-                ]
-                for ref in to_wake:
-                    sender, _ = waiting_tasks.pop(ref)
-                    send(sender, ref, hint="wake")
+        @timer.branch_handler(Loop)
+        async def loop():
+            send(self(), Loop)
+
+            current_time = now()
+            to_wake = [
+                ref
+                for ref, (_, wake_time) in waiting_tasks.items()
+                if wake_time <= current_time
+            ]
+            for ref in to_wake:
+                sender, _ = waiting_tasks.pop(ref)
+                send(sender, ref, hint="wake")
 
         return initialize(timer, message(Loop))
 
@@ -901,21 +806,21 @@ def responder(fn: ResponderFn):
 
 
 def loop(fn: Callable[..., Awaitable[None]]) -> StateMachineInit:
-    with build_state_machine() as sm:
+    sm = SMBuilder()
 
-        @async_branch_handler(Loop)
-        async def start():
-            send(self(), Loop)
-            await fn()
+    @sm.branch_handler(Loop)
+    async def start():
+        send(self(), Loop)
+        await fn()
 
     return initialize(sm, message(Loop))
 
 
 def launch(fn: Callable[..., Awaitable[None]]) -> StateMachineInit:
-    with build_state_machine() as t:
+    sm = SMBuilder()
 
-        @async_branch_handler(None)
-        async def start():
-            await fn()
+    @sm.branch_handler(None)
+    async def start():
+        await fn()
 
-    return initialize(t, message(None))
+    return initialize(sm, message(None))

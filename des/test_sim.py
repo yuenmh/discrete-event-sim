@@ -5,10 +5,9 @@ from .sim import (
     Atom,
     EventLoop,
     Ref,
+    SMBuilder,
     ask,
     ask_timeout,
-    async_branch_handler,
-    build_state_machine,
     launch,
     log,
     loop,
@@ -22,11 +21,11 @@ def test_simple():
     class Add(Atom): ...
 
     def make_adder():
-        with build_state_machine() as adder:
+        adder = SMBuilder()
 
-            @async_branch_handler(Add)
-            async def add(sender: Addr, ref: Ref, a: int, b: int):
-                send(sender, ref, a + b)
+        @adder.branch_handler(Add)
+        async def add(sender: Addr, ref: Ref, a: int, b: int):
+            send(sender, ref, a + b)
 
         return adder
 
