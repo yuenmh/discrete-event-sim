@@ -41,7 +41,6 @@ __all__ = [
     "self",
     "self_node",
     "wait",
-    "select",
     "log",
     "now",
     "rng",
@@ -650,11 +649,12 @@ async def wait(*args: Any, **kwargs: Any) -> tuple[Any, ...]:
     return *msg.args, msg.kwargs
 
 
-async def select(*options: Message) -> tuple[Any, ...]:
-    _, msg = await _wait_inner(
-        SelectionMatcher(*(SingleMatcher(opt.args, opt.kwargs) for opt in options))
-    )
-    return *msg.args, msg.kwargs
+async def _race_refs(*refs: Ref):
+    result, message = await _wait_inner(_FusedRefSelect(refs))
+    dropped = [ref for i, ref in enumerate(refs) if i != result.branch_id]
+    for ref in dropped:
+        self_node().set_drop_hint(_FusedRefSelect((ref,)))
+    return message
 
 
 def log(msg: str | None = None, /, **kwargs: Any):
@@ -700,30 +700,16 @@ async def ask_timeout(
     addr: Addr,
     method: Any,
     *args: Any,
-    deadline: int | None = None,
 ) -> Any:
     result_ref = Ref()
     send(addr, method, self(), result_ref, *args)
     sleep_ref = Ref()
     send(_TIMER_ADDR, Sleep, self(), sleep_ref, timeout)
-    deadline_ref = Ref()
-    if deadline is not None:
-        send(_TIMER_ADDR, SleepUntil, self(), sleep_ref, deadline)
-    result, msg = await _wait_inner(
-        _FusedRefSelect((result_ref, sleep_ref, deadline_ref))
-    )
-    if result.branch_id == 0:
-        self_node().set_drop_hint(SingleMatcher((sleep_ref,), {}))
-        self_node().set_drop_hint(SingleMatcher((deadline_ref,), {}))
+    msg = await _race_refs(result_ref, sleep_ref)
+    if msg.args[0] == result_ref:
         return msg.args[1]
     else:
-        self_node().set_drop_hint(SingleMatcher((result_ref,), {}))
-        if result.branch_id == 1:
-            self_node().set_drop_hint(SingleMatcher((deadline_ref,), {}))
-            raise Timeout(f"Timed out after {timeout} epochs")
-        else:
-            self_node().set_drop_hint(SingleMatcher((sleep_ref,), {}))
-            raise Timeout(f"Timed out at deadline epoch {deadline}", is_deadline=True)
+        raise Timeout(f"Timed out after {timeout} epochs")
 
 
 class Loop(Atom): ...
