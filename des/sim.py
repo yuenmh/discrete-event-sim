@@ -571,7 +571,7 @@ class EventLoop:
         self.rngs = dict[Addr, Random]()
 
         if not without_defaults:
-            self.spawn_spec(*RUNTIME_SPECS)
+            self.spawn(_TIMER_ADDR, _make_timer())
             self.nodes[_TIMER_ADDR].unlimited_fuel = True
 
     def spawn(
@@ -583,10 +583,6 @@ class EventLoop:
         node.inbox.extend(init.messages)
         self.nodes[addr] = node
         self.rngs[addr] = Random(hashlib.sha256(addr.name.encode()).digest())
-
-    def spawn_spec(self, *specs: NodeSpec):
-        for spec in specs:
-            self.spawn(spec.addr, spec.init())
 
     def run(self, epochs: int = 1, condition: StopCondition | None = None):
         for _ in tqdm(range(epochs), unit="epoch", total=epochs):
@@ -732,51 +728,39 @@ def sleep_until(deadline: int):
     return ask(_TIMER_ADDR, SleepUntil, deadline)
 
 
-class NodeSpec(Protocol):
-    @property
-    def addr(self) -> Addr: ...
-    def init(self) -> StateMachineInit: ...
+def _make_timer():
+    waiting_tasks: dict[Ref, tuple[Addr, int]] = {}
 
+    timer = SMBuilder()
 
-class TimerSpec:
-    addr = _TIMER_ADDR
+    @timer.handle(Sleep)
+    async def sleep(sender: Addr, ref: Ref, duration: int):
+        wake_time = now() + duration
+        waiting_tasks[ref] = (sender, wake_time)
 
-    def init(_self):
-        waiting_tasks: dict[Ref, tuple[Addr, int]] = {}
+    @timer.handle(SleepUntil)
+    async def sleep_until(sender: Addr, ref: Ref, until: int):
+        if until <= now():
+            send(sender, ref)
+            return
+        wake_time = until
+        waiting_tasks[ref] = (sender, wake_time)
 
-        timer = SMBuilder()
+    @timer.handle(Loop)
+    async def loop():
+        send(self(), Loop)
 
-        @timer.handle(Sleep)
-        async def sleep(sender: Addr, ref: Ref, duration: int):
-            wake_time = now() + duration
-            waiting_tasks[ref] = (sender, wake_time)
+        current_time = now()
+        to_wake = [
+            ref
+            for ref, (_, wake_time) in waiting_tasks.items()
+            if wake_time <= current_time
+        ]
+        for ref in to_wake:
+            sender, _ = waiting_tasks.pop(ref)
+            send(sender, ref, hint="wake")
 
-        @timer.handle(SleepUntil)
-        async def sleep_until(sender: Addr, ref: Ref, until: int):
-            if until <= now():
-                send(sender, ref)
-                return
-            wake_time = until
-            waiting_tasks[ref] = (sender, wake_time)
-
-        @timer.handle(Loop)
-        async def loop():
-            send(self(), Loop)
-
-            current_time = now()
-            to_wake = [
-                ref
-                for ref, (_, wake_time) in waiting_tasks.items()
-                if wake_time <= current_time
-            ]
-            for ref in to_wake:
-                sender, _ = waiting_tasks.pop(ref)
-                send(sender, ref, hint="wake")
-
-        return initialize(timer, message(Loop))
-
-
-RUNTIME_SPECS = (TimerSpec(),)
+    return initialize(timer, message(Loop))
 
 
 class ResponderFn(Protocol):
