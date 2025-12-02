@@ -1,6 +1,7 @@
+import argparse
 import csv
 import multiprocessing
-import os
+import re
 from typing import (
     Any,
     Callable,
@@ -347,19 +348,23 @@ class Runner:
         else:
             raise TypeError("Unsupported result type")
 
-    def run_all(self, force: bool = False, concurrent: bool = True):
+    def run_all(
+        self,
+        concurrent: bool = True,
+        filter: re.Pattern[str] | None = None,
+    ):
         runs = []
         for name, fn, inputs in self.runs:
             for input in inputs:
                 output_path = f"results/{name}-{input}.csv"
-                if os.path.exists(output_path) and not force:
-                    print(f"Skip {name} with input {input} (already exists)")
-                    continue
                 runs.append((name, fn, input, output_path))
 
+        if filter is not None:
+            runs = [run for run in runs if filter.match(run[0])]
+
         print("To run")
-        for name, *_ in runs:
-            print(f"  {name}")
+        for name, _, input, *_ in runs:
+            print(f"  {name} - {input}")
 
         if concurrent:
             pool = multiprocessing.Pool()
@@ -417,7 +422,22 @@ def multiple_servers(version: Literal["control", "test"]):
 
 
 def main():
-    runner.run_all(force=True, concurrent=True)
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--filter", type=str, default=None)
+    parser.add_argument(
+        "--concurrent", action=argparse.BooleanOptionalAction, default=True
+    )
+    args = parser.parse_args()
+
+    print("Running with args")
+    for k, v in vars(args).items():
+        print(f"  {k} = {v!r}")
+    print()
+
+    runner.run_all(
+        concurrent=args.concurrent,
+        filter=re.compile(args.filter) if args.filter else None,
+    )
 
 
 if __name__ == "__main__":
