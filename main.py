@@ -21,7 +21,6 @@ from des.sim import (
     SMBuilder,
     StateMachineInit,
     Timeout,
-    ask,
     ask_timeout,
     launch,
     log,
@@ -36,9 +35,16 @@ from des.sim import (
 from des.stdlib import Err, Ok, Queue
 
 
-def constant_retry(sleep_time: int):
+def constant_retry(wait_time: int):
     def policy(_try_num: int) -> int:
-        return sleep_time
+        return wait_time
+
+    return policy
+
+
+def linear_backoff_retry(base_wait_time: int, per_try: int):
+    def policy(try_num: int) -> int:
+        return base_wait_time + (per_try * try_num)
 
     return policy
 
@@ -107,8 +113,8 @@ def run_experiment(
     lb_addr = Addr("load_balancer")
 
     async def submit_work_wrapper(
+        timeout: int,
         n_retries: int = 3,
-        timeout: int | None = None,
         policy: Callable[[int], int] = constant_retry(10),
         deadline: int | None = None,
     ) -> bool:
@@ -122,23 +128,20 @@ def run_experiment(
                     submission_id=submission_id,
                 )
                 return False
-            if timeout:
-                try:
-                    result = await ask_timeout(
-                        timeout,
-                        lb_addr,
-                        SubmitWork,
-                    )
-                except Timeout:
-                    log(
-                        "timeout",
-                        after=timeout,
-                        try_num=try_num,
-                        submission_id=submission_id,
-                    )
-                    result = Err()
-            else:
-                result = await ask(lb_addr, SubmitWork)
+            try:
+                result = await ask_timeout(
+                    timeout,
+                    lb_addr,
+                    SubmitWork,
+                )
+            except Timeout:
+                log(
+                    "timeout",
+                    after=timeout,
+                    try_num=try_num,
+                    submission_id=submission_id,
+                )
+                result = Err()
             match result:
                 case Ok():
                     return True
@@ -152,8 +155,8 @@ def run_experiment(
     async def perform_work(deadline: int | None = None):
         start = now()
         success = await submit_work_wrapper(
-            n_retries=num_retries,
             timeout=submit_timeout,
+            n_retries=num_retries,
             policy=retry_policy,
             deadline=deadline,
         )
@@ -377,27 +380,25 @@ class Runner:
 runner = Runner()
 
 
-def run_single_server_case(queue_size: int):
-    return run_experiment(
-        num_workers=1,
-        queue_size=queue_size,
-        num_retries=100_000,
-        num_epochs=40_000,
-        spike_offset=8000,
-        spike_duration=2000,
-        num_clients=3,
-        num_clients_spike=5,
-        num_clients_after_spike=3,
-        submit_timeout=83,
-        work_time_range=(25, 27),
-        inter_task_sleep_range=(49, 52),
-        retry_policy=constant_retry(2),
-    )
-
-
 @runner.trial([1, 10])
 def single_server_vary_queue_size(qs):
-    return analyze_result(run_single_server_case(queue_size=qs))
+    return analyze_result(
+        run_experiment(
+            num_workers=1,
+            queue_size=qs,
+            num_retries=100_000,
+            num_epochs=40_000,
+            spike_offset=8000,
+            spike_duration=2000,
+            num_clients=3,
+            num_clients_spike=5,
+            num_clients_after_spike=3,
+            work_time_range=(25, 27),
+            inter_task_sleep_range=(49, 52),
+            submit_timeout=83,
+            retry_policy=constant_retry(wait_time=2),
+        )
+    )
 
 
 @runner.trial(["control", "test"])
@@ -413,10 +414,33 @@ def multiple_servers(version: Literal["control", "test"]):
             num_clients=12,
             num_clients_spike=20,
             num_clients_after_spike=12,
-            submit_timeout=83,
             work_time_range=(25, 27),
             inter_task_sleep_range=(49, 52),
-            retry_policy=constant_retry(2),
+            submit_timeout=83,
+            retry_policy=constant_retry(wait_time=2),
+        )
+    )
+
+
+@runner.trial(["control", "test-linear", "test-const"])
+def linear_backoff(version: Literal["control", "test-linear", "test-const"]):
+    return analyze_result(
+        run_experiment(
+            num_workers=1,
+            queue_size=20,
+            num_retries=100_000,
+            num_epochs=60_000,
+            spike_offset=12000 if "test" in version else 100_000,
+            spike_duration=2000,
+            num_clients=12,
+            num_clients_spike=20,
+            num_clients_after_spike=12,
+            work_time_range=(100, 120),
+            inter_task_sleep_range=(2, 5),
+            submit_timeout=12 * 110 + 70,
+            retry_policy=constant_retry(0)
+            if version == "test-const"
+            else linear_backoff_retry(base_wait_time=0, per_try=1),
         )
     )
 
