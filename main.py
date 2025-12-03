@@ -61,15 +61,16 @@ def run_experiment(
     spike_offset: int = 10000,
     spike_duration: int = 3000,
     submit_timeout: int = 30,
-    work_time_range: tuple[int, int] = (5, 20),
-    inter_task_sleep_range: tuple[int, int] = (10, 30),
+    work_time: tuple[int, int] = (5, 2),
+    inter_task_sleep: tuple[int, int] = (10, 3),
+    added_client_wake_range: int = 300,
 ):
     def make_worker(queue: Queue[tuple[Addr, Ref]]):
         @loop
         async def start():
             addr, ref = await queue.dequeue()
             log("start task", ref=ref)
-            await sleep(rng().randrange(*work_time_range))
+            await sleep(work_time[0] + int(rng().expovariate(1.0 / work_time[1])))
             log("finish task", ref=ref)
             send(addr, ref, Ok, hint="task_finished")
 
@@ -167,28 +168,32 @@ def run_experiment(
 
     clients: list[StateMachineInit] = []
 
+    async def sleep_between_tasks():
+        await sleep(
+            inter_task_sleep[0] + int(rng().expovariate(1.0 / inter_task_sleep[1]))
+        )
+
     def make_normal_client(client_ix: int):
         @launch
         async def client():
             log("client started", client_ix=client_ix)
             while True:
                 await perform_work()
-                await sleep(rng().randrange(*inter_task_sleep_range))
+                await sleep_between_tasks()
 
         return client
 
     def make_spike_client(client_ix: int):
         @launch
         async def client():
-            await sleep(spike_offset + rng().randrange(0, 300))
+            wake_offset = rng().randrange(0, added_client_wake_range)
+            await sleep(spike_offset + wake_offset)
             log("client started", client_ix=client_ix)
             while True:
-                await perform_work(
-                    deadline=spike_offset + spike_duration + rng().randrange(0, 300)
-                )
+                await perform_work(deadline=spike_offset + spike_duration + wake_offset)
                 if now() >= spike_offset + spike_duration:
                     break
-                await sleep(rng().randrange(*inter_task_sleep_range))
+                await sleep_between_tasks()
             log("client exited", client_ix=client_ix)
             stop()
 
@@ -197,11 +202,11 @@ def run_experiment(
     def make_added_client(client_ix: int):
         @launch
         async def client():
-            await sleep(spike_offset + rng().randrange(0, 300))
+            await sleep(spike_offset + rng().randrange(0, added_client_wake_range))
             log("client started", client_ix=client_ix)
             while True:
                 await perform_work()
-                await sleep(rng().randrange(*inter_task_sleep_range))
+                await sleep_between_tasks()
 
         return client
 
@@ -387,14 +392,14 @@ def single_server_vary_queue_size(qs):
             num_workers=1,
             queue_size=qs,
             num_retries=100_000,
-            num_epochs=40_000,
+            num_epochs=60_000,
             spike_offset=8000,
             spike_duration=2000,
             num_clients=3,
             num_clients_spike=5,
             num_clients_after_spike=3,
-            work_time_range=(26, 28),
-            inter_task_sleep_range=(49, 52),
+            work_time=(22, 5),
+            inter_task_sleep=(50, 5),
             submit_timeout=83,
             retry_policy=constant_retry(wait_time=2),
         )
@@ -414,8 +419,8 @@ def multiple_servers(version: Literal["control", "test"]):
             num_clients=12,
             num_clients_spike=20,
             num_clients_after_spike=12,
-            work_time_range=(26, 28),
-            inter_task_sleep_range=(49, 52),
+            work_time=(22, 5),
+            inter_task_sleep=(50, 5),
             submit_timeout=83,
             retry_policy=constant_retry(wait_time=2),
         )
@@ -435,8 +440,8 @@ def linear_backoff(version: Literal["control", "test-linear", "test-const"]):
             num_clients=12,
             num_clients_spike=20,
             num_clients_after_spike=12,
-            work_time_range=(100, 120),
-            inter_task_sleep_range=(2, 5),
+            work_time=(100, 7),
+            inter_task_sleep=(2, 2),
             submit_timeout=12 * 110 + 70,
             retry_policy=constant_retry(0)
             if version == "test-const"

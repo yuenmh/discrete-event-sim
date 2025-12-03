@@ -646,7 +646,7 @@ class EventLoop:
                 break
             self.commit_logs()
 
-        return RunResult(logs=self.logs, num_epochs=self.epoch)
+        return RunResult(logs=self.logs, num_epochs=max(0, self.epoch - 1))
 
     def commit_logs(self):
         self.logs.extend(self.new_logs)
