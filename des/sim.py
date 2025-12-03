@@ -1,4 +1,5 @@
 import hashlib
+import heapq
 import inspect
 import sqlite3
 import types
@@ -8,11 +9,13 @@ from contextvars import ContextVar
 from dataclasses import dataclass, field, replace
 from random import Random
 from typing import (
+    TYPE_CHECKING,
     Any,
     Awaitable,
     Callable,
     Coroutine,
     Generator,
+    Iterable,
     Mapping,
     Protocol,
     Self,
@@ -22,7 +25,9 @@ from typing import (
 from uuid import UUID, uuid4
 
 from frozendict import frozendict
-from tqdm import tqdm
+
+if TYPE_CHECKING:
+    from _typeshed import SupportsAllComparisons
 
 __all__ = [
     "Message",
@@ -206,7 +211,7 @@ class Context(Protocol):
     @property
     def self_addr(self) -> Addr: ...
     @property
-    def sent_messages(self) -> list[tuple[Addr, Message]]: ...
+    def sent_messages(self) -> list[Event]: ...
 
 
 class StateMachine(Protocol):
@@ -412,7 +417,7 @@ def async_transition(continuation: StateMachine):
 class ContextImpl:
     event_loop: EventLoop
     self_addr: Addr
-    sent_messages: list[tuple[Addr, Message]]
+    sent_messages: list[Event]
 
 
 class _LeakDetector:
@@ -438,14 +443,12 @@ class Node:
         self.inbox: list[Message] = []
         self.drop_hints: list[Matcher] = []
         self.fuel_per_epoch: int | None = None
-        self.unlimited_fuel = False
+        self.unlimited_fuel = True
         self.stopped = False
         self._detector = _LeakDetector(alpha=0.09, threshold=0.1)
         self._addr = None
 
-    def run(
-        self, fuel: int, self_addr: Addr, event_loop: EventLoop
-    ) -> list[tuple[Addr, Message]]:
+    def run(self, fuel: int, self_addr: Addr, event_loop: EventLoop) -> list[Event]:
         self._addr = self_addr
         if self.stopped:
             return []
@@ -539,40 +542,68 @@ class RunResult:
         return conn
 
 
-class StopCondition(Protocol):
-    def process_logs(self, logs: list[LogEntry]): ...
-    @property
-    def should_stop(self) -> bool: ...
+@dataclass(slots=True)
+class _PQEntry[T]:
+    priority: SupportsAllComparisons
+    item: T
+
+    def __lt__(self, other: Self):
+        return self.priority < other.priority
+
+    def __gt__(self, other: Self):
+        return self.priority > other.priority
 
 
-class StopAfterNodesExited:
-    def __init__(self, nodes: Sequence[Addr], exit_msg: str = "exited"):
-        self.nodes = set(nodes)
-        self.exit_msg = exit_msg
-        self.exited_nodes = set()
+class PriorityQueue[T]:
+    def __init__(self, *items: T, key: Callable[[T]] = lambda x: x):
+        self._key = key
+        self._items = list(_PQEntry(key(item), item) for item in items)
+        heapq.heapify(self._items)
 
-    def process_logs(self, logs: list[LogEntry]):
-        for log in logs:
-            if log.msg == self.exit_msg and log.addr in self.nodes:
-                self.exited_nodes.add(log.addr)
+    def push(self, item: T):
+        heapq.heappush(self._items, _PQEntry(self._key(item), item))
 
-    @property
-    def should_stop(self) -> bool:
-        return self.exited_nodes == self.nodes
+    def extend(self, items: Iterable[T]):
+        for item in items:
+            self.push(item)
+
+    def pop(self) -> T | None:
+        if not self._items:
+            return None
+        return heapq.heappop(self._items).item
+
+    def pop_while(self, cond: Callable[[T], bool]) -> Generator[T]:
+        while self._items and cond(self._items[0].item):
+            yield heapq.heappop(self._items).item
+
+    def peek(self) -> T | None:
+        if not self._items:
+            return None
+        return self._items[0].item
+
+    def __len__(self) -> int:
+        return len(self._items)
+
+    def __bool__(self) -> bool:
+        return bool(self._items)
+
+
+@dataclass
+class Event:
+    recipient: Addr
+    delivery_epoch: int
+    message: Message
 
 
 class EventLoop:
-    def __init__(self, without_defaults: bool = False):
+    def __init__(self):
         self.nodes = dict[Addr, Node]()
         self.fuel_per_epoch = 100
         self.logs: list[LogEntry] = []
         self.new_logs: list[LogEntry] = []
         self.epoch = 0
         self.rngs = dict[Addr, Random]()
-
-        if not without_defaults:
-            self.spawn(_TIMER_ADDR, _make_timer())
-            self.nodes[_TIMER_ADDR].unlimited_fuel = True
+        self.event_queue = PriorityQueue[Event](key=lambda event: event.delivery_epoch)
 
     def spawn(
         self,
@@ -584,29 +615,35 @@ class EventLoop:
         self.nodes[addr] = node
         self.rngs[addr] = Random(hashlib.sha256(addr.name.encode()).digest())
 
-    def run(self, epochs: int = 1, condition: StopCondition | None = None):
-        for _ in tqdm(range(epochs), unit="epoch", total=epochs):
-            sent_messages: list[tuple[Addr, Message]] = []
+    def run(self, epochs: int = 1):
+        while True:
+            if self.epoch >= epochs:
+                break
+
+            events = list(
+                self.event_queue.pop_while(lambda e: e.delivery_epoch <= self.epoch)
+            )
+
+            for event in events:
+                try:
+                    node = self.nodes[event.recipient]
+                except KeyError:
+                    raise RuntimeError(f"Send to unknown address: {event}")
+                node.deliver(event.message)
+
             for addr, node in self.nodes.items():
-                sent_messages.extend(
+                self.event_queue.extend(
                     node.run(
                         fuel=node.fuel_per_epoch or self.fuel_per_epoch,
                         self_addr=addr,
                         event_loop=self,
                     )
                 )
-            for dest_addr, raw_msg in sent_messages:
-                try:
-                    self.nodes[dest_addr].deliver(raw_msg)
-                except KeyError:
-                    raise RuntimeError(f"Unknown address: {dest_addr}")
 
-            if condition is not None:
-                condition.process_logs(self.new_logs)
-                if condition.should_stop:
-                    break
-
-            self.epoch += 1
+            if next_event := self.event_queue.peek():
+                self.epoch = max(self.epoch + 1, next_event.delivery_epoch)
+            else:
+                break
             self.commit_logs()
 
         return RunResult(logs=self.logs, num_epochs=self.epoch)
@@ -620,7 +657,15 @@ class EventLoop:
 
 
 def send(addr: Addr, *args: Any, **kwargs: Any):
-    context().sent_messages.append((addr, message(*args, **kwargs)))
+    context().sent_messages.append(
+        Event(recipient=addr, delivery_epoch=0, message=message(*args, **kwargs))
+    )
+
+
+def send_scheduled(at: int, addr: Addr, *args: Any, **kwargs: Any):
+    context().sent_messages.append(
+        Event(recipient=addr, delivery_epoch=at, message=message(*args, **kwargs))
+    )
 
 
 def self() -> Addr:
@@ -703,9 +748,9 @@ async def ask_timeout(
 ) -> Any:
     result_ref = Ref()
     send(addr, method, self(), result_ref, *args)
-    sleep_ref = Ref()
-    send(_TIMER_ADDR, Sleep, self(), sleep_ref, timeout)
-    msg = await _race_refs(result_ref, sleep_ref)
+    timeout_ref = Ref()
+    send_scheduled(now() + timeout, self(), timeout_ref, hint="timeout")
+    msg = await _race_refs(result_ref, timeout_ref)
     if msg.args[0] == result_ref:
         return msg.args[1]
     else:
@@ -715,56 +760,16 @@ async def ask_timeout(
 class Loop(Atom): ...
 
 
-class Sleep(Atom): ...
+async def sleep(duration: int):
+    ref = Ref()
+    send_scheduled(now() + duration, self(), ref, hint="wake")
+    await wait(ref)
 
 
-class SleepUntil(Atom): ...
-
-
-_TIMER_ADDR = Addr("__internal.timer")
-
-
-def sleep(duration: int):
-    return ask(_TIMER_ADDR, Sleep, duration)
-
-
-def sleep_until(deadline: int):
-    return ask(_TIMER_ADDR, SleepUntil, deadline)
-
-
-def _make_timer():
-    waiting_tasks: dict[Ref, tuple[Addr, int]] = {}
-
-    timer = SMBuilder()
-
-    @timer.handle(Sleep)
-    async def sleep(sender: Addr, ref: Ref, duration: int):
-        wake_time = now() + duration
-        waiting_tasks[ref] = (sender, wake_time)
-
-    @timer.handle(SleepUntil)
-    async def sleep_until(sender: Addr, ref: Ref, until: int):
-        if until <= now():
-            send(sender, ref)
-            return
-        wake_time = until
-        waiting_tasks[ref] = (sender, wake_time)
-
-    @timer.handle(Loop)
-    async def loop():
-        send(self(), Loop)
-
-        current_time = now()
-        to_wake = [
-            ref
-            for ref, (_, wake_time) in waiting_tasks.items()
-            if wake_time <= current_time
-        ]
-        for ref in to_wake:
-            sender, _ = waiting_tasks.pop(ref)
-            send(sender, ref, hint="wake")
-
-    return initialize(timer, message(Loop))
+async def sleep_until(deadline: int):
+    ref = Ref()
+    send_scheduled(deadline, self(), ref, hint="wake")
+    await wait(ref)
 
 
 class ResponderFn(Protocol):
