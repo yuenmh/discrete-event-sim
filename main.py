@@ -10,6 +10,9 @@ from typing import (
     Sequence,
 )
 
+import matplotlib.pyplot as plt
+import numpy as np
+import polars as pl
 from tqdm import tqdm
 
 from des.sim import (
@@ -21,6 +24,7 @@ from des.sim import (
     SMBuilder,
     StateMachineInit,
     Timeout,
+    ask,
     ask_timeout,
     launch,
     log,
@@ -31,6 +35,7 @@ from des.sim import (
     send,
     sleep,
     stop,
+    wait_timeout,
 )
 from des.stdlib import Err, Ok, Queue
 
@@ -232,7 +237,7 @@ def run_experiment(
     return result
 
 
-def analyze_result(result: RunResult):
+def analyze_result(result: RunResult, smoothing_window: int = 300):
     import numpy as np
     import polars as pl
 
@@ -267,7 +272,6 @@ def analyze_result(result: RunResult):
             .with_columns(pl.col("value").forward_fill().fill_null(0))
         )
 
-        smoothing_window = 300
         smoothed_latency = np.convolve(
             latency_result_df["value"].to_numpy(),
             np.ones(smoothing_window) / smoothing_window,
@@ -450,23 +454,276 @@ def linear_backoff(version: Literal["control", "test-linear", "test-const"]):
     )
 
 
+@runner.trial(("control", "test"))
+def large_timescale(version: str):
+    return analyze_result(
+        run_experiment(
+            num_workers=1,
+            queue_size=20,
+            num_retries=100_000,
+            num_epochs=500_000,
+            spike_offset=100_000,
+            spike_duration=30_000,
+            num_clients=5,
+            num_clients_spike=8 if version == "test" else 5,
+            num_clients_after_spike=5,
+            work_time=(1_000, 500),
+            inter_task_sleep=(0, 200),
+            submit_timeout=5 * 2_000,
+            retry_policy=constant_retry(200),
+        ),
+        smoothing_window=1000,
+    )
+
+
+def smooth_series(series: pl.Series, avg_window: int) -> pl.Series:
+    return pl.Series(
+        name=series.name,
+        values=np.convolve(
+            series.to_numpy(),
+            np.ones(avg_window) / avg_window,
+        )[: len(series)],
+    )
+
+
+def experiment2():
+    work_time = 1000
+    work_time_rand = 100
+    timeout = 1800
+    retry_delay = 100
+    inter_sleep = 4000
+    full_delay = 12000
+
+    trigger_delay = 1_000_000
+
+    this = self
+
+    queue_addr = Addr("queue")
+    queue = Queue[tuple[Addr, Ref]](queue_addr)
+
+    class Worker:
+        def __init__(self, addr: Addr):
+            self.queue_addr = addr
+
+        async def submit(self, ref: Ref, timeout: int) -> bool:
+            log("submit", ref=ref)
+            if await ask(self.queue_addr, Queue.Enqueue, (this(), ref)) is Queue.Full:
+                log("fail", ref=ref, reason="full")
+                await sleep(full_delay)
+                return False
+            try:
+                await wait_timeout(timeout, ref)
+            except Timeout:
+                log("fail", ref=ref, reason="timeout")
+                return False
+            return True
+
+    worker = Worker(queue_addr)
+
+    @launch
+    async def worker_process():
+        while True:
+            addr, ref = await queue.dequeue()
+            await sleep(
+                work_time - work_time_rand + int(rng().expovariate(1 / work_time_rand))
+            )
+            send(addr, ref, hint="done")
+
+    @launch
+    async def client():
+        while True:
+            retries = 0
+            start = now()
+            ref = Ref()
+            while not await worker.submit(ref, timeout=timeout):
+                retries += 1
+                log("retry", ref=ref, retries=retries)
+                await sleep(retry_delay)
+            log("done", ref=ref, retries=retries, start=start, duration=now() - start)
+            await sleep(inter_sleep)
+
+    @launch
+    async def client2():
+        await sleep(200)
+        while True:
+            retries = 0
+            start = now()
+            ref = Ref()
+            while not await worker.submit(ref, timeout=timeout):
+                retries += 1
+                log("retry", ref=ref, retries=retries)
+                await sleep(retry_delay)
+            log("done", ref=ref, retries=retries, start=start, duration=now() - start)
+            await sleep(inter_sleep)
+
+    @launch
+    async def trigger():
+        # return
+        await sleep(trigger_delay)
+        for _ in range(20):
+            await worker.submit(Ref(), timeout=50)
+
+    el = EventLoop()
+    el.spawn(queue_addr, Queue.create(max_size=20))
+    el.spawn(Addr("worker"), worker_process)
+    el.spawn(Addr("client"), client)
+    el.spawn(Addr("client2"), client2)
+    el.spawn(Addr("trigger"), trigger)
+    result = el.run(epochs=2_000_000)
+
+    avg_window = 10
+    task_times = (
+        pl.DataFrame(
+            [
+                (
+                    entry.data["start"] // 1000,
+                    entry.data["duration"],
+                    entry.data["retries"],
+                )
+                for entry in result.logs
+                if entry.msg == "done" and entry.addr.name.startswith("client")
+            ],
+            schema=["epoch", "duration", "retries"],
+            orient="row",
+        )
+        .group_by("epoch", maintain_order=True)
+        .agg(pl.col("*").mean())
+    )
+    task_times = task_times.with_columns(
+        pl.Series(
+            name="duration",
+            values=np.convolve(
+                task_times["duration"].to_numpy(),
+                np.ones(avg_window) / avg_window,
+            )[: len(task_times)],
+        )
+    )
+    task_times = task_times.with_columns(
+        pl.arange(0, len(task_times)).alias("completed")
+    )
+
+    goodput = (
+        pl.DataFrame()
+        .with_columns(
+            pl.arange(0, max(e.epoch for e in result.logs) // 1000 + 1).alias("epoch")
+        )
+        .join(task_times, on="epoch", how="left", maintain_order="left")
+        .select("epoch", "completed")
+        .with_columns(pl.col("completed").fill_null(strategy="forward").fill_null(0))
+    )
+    goodput = goodput.with_columns(
+        pl.Series(
+            name="completed",
+            values=np.convolve(
+                goodput["completed"].to_numpy(),
+                np.ones(avg_window * 3) / (avg_window * 3),
+            )[: len(goodput)],
+        )
+    )
+    goodput = goodput.with_columns(
+        pl.col("completed").diff().fill_null(0).alias("goodput")
+    )
+
+    queue_size = (
+        pl.DataFrame(
+            [
+                (entry.epoch // 1000, entry.data["size"])
+                for entry in result.logs
+                if entry.msg == "queue size"
+            ],
+            schema=["epoch", "size"],
+            orient="row",
+        )
+        .group_by("epoch", maintain_order=True)
+        .agg(pl.col("size").mean())
+    )
+    queue_size = queue_size.with_columns(
+        pl.Series(
+            name="size",
+            values=np.convolve(
+                queue_size["size"].to_numpy(),
+                np.ones(avg_window) / avg_window,
+            )[: len(queue_size)],
+        )
+    )
+
+    sends = (
+        pl.DataFrame(
+            [
+                (entry.epoch // 10000)
+                for entry in result.logs
+                if entry.addr.name.startswith("client") and entry.msg == "submit"
+            ],
+            schema=["epoch"],
+            orient="row",
+        )
+        .group_by("epoch", maintain_order=True)
+        .agg(pl.len().alias("sends"))
+        .with_columns(pl.col("epoch") * 10)
+    )
+
+    full = (
+        pl.DataFrame(
+            [
+                (entry.epoch // 1000)
+                for entry in result.logs
+                if entry.data.get("reason") == "full"
+            ],
+            schema=["epoch"],
+            orient="row",
+        )
+        .group_by("epoch", maintain_order=True)
+        .agg(pl.len().alias("fulls"))
+    )
+
+    retries = (
+        pl.DataFrame(
+            [(entry.epoch // 1000) for entry in result.logs if entry.msg == "retry"],
+            schema=["epoch"],
+            orient="row",
+        )
+        .group_by("epoch", maintain_order=True)
+        .agg(pl.len().alias("retries"))
+    )
+    retries = retries.with_columns(
+        smooth_series(retries.get_column("retries"), avg_window=avg_window)
+    )
+
+    fig = plt.figure(figsize=(18, 8))
+    fig.suptitle("Metrics")
+    fig.tight_layout()
+
+    grid = (2, 3)
+
+    # ax1 = fig.add_subplot(*grid, 1)
+    # ax1.set_title("Average Task Duration")
+    # ax1.plot(task_times["epoch"], task_times["duration"], linewidth=1)
+
+    ax2 = fig.add_subplot(*grid, 2)
+    ax2.set_title("Total Completed Tasks")
+    ax2.plot(goodput["epoch"], goodput["completed"], linewidth=1)
+
+    ax3 = fig.add_subplot(*grid, 3)
+    ax3.set_title("Average Queue Size")
+    ax3.plot(queue_size["epoch"], queue_size["size"], linewidth=1)
+
+    ax4 = fig.add_subplot(*grid, 4)
+    ax4.set_title("Goodput (Tasks per Second)")
+    ax4.plot(goodput["epoch"], goodput["goodput"], linewidth=1)
+
+    ax5 = fig.add_subplot(*grid, 5)
+    ax5.set_title("Task Retries")
+    ax5.plot(retries["epoch"], retries["retries"], linewidth=1)
+
+    ax6 = fig.add_subplot(*grid, 6)
+    ax6.set_title("Sends per Second")
+    ax6.plot(sends["epoch"], sends["sends"], linewidth=1)
+
+    plt.show(block=True)
+
+
 def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--filter", type=str, default=None)
-    parser.add_argument(
-        "--concurrent", action=argparse.BooleanOptionalAction, default=True
-    )
-    args = parser.parse_args()
-
-    print("Running with args")
-    for k, v in vars(args).items():
-        print(f"  {k} = {v!r}")
-    print()
-
-    runner.run_all(
-        concurrent=args.concurrent,
-        filter=re.compile(args.filter) if args.filter else None,
-    )
+    experiment2()
 
 
 if __name__ == "__main__":
