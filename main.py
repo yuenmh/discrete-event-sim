@@ -1,4 +1,3 @@
-import argparse
 import csv
 import multiprocessing
 import re
@@ -488,11 +487,10 @@ def smooth_series(series: pl.Series, avg_window: int) -> pl.Series:
 
 def experiment2():
     work_time = 1000
-    work_time_rand = 100
-    timeout = 1800
+    work_time_rand = 200
+    timeout = 1900
     retry_delay = 100
     inter_sleep = 4000
-    full_delay = 12000
 
     trigger_delay = 1_000_000
 
@@ -509,7 +507,6 @@ def experiment2():
             log("submit", ref=ref)
             if await ask(self.queue_addr, Queue.Enqueue, (this(), ref)) is Queue.Full:
                 log("fail", ref=ref, reason="full")
-                await sleep(full_delay)
                 return False
             try:
                 await wait_timeout(timeout, ref)
@@ -569,59 +566,37 @@ def experiment2():
     el.spawn(Addr("client"), client)
     el.spawn(Addr("client2"), client2)
     el.spawn(Addr("trigger"), trigger)
-    result = el.run(epochs=2_000_000)
+    result = el.run(epochs=3_000_000)
+
+    max_epoch_s = max(e.epoch for e in result.logs) // 1000 + 1
 
     avg_window = 10
-    task_times = (
+
+    goodput = (
         pl.DataFrame(
             [
-                (
-                    entry.data["start"] // 1000,
-                    entry.data["duration"],
-                    entry.data["retries"],
-                )
+                (entry.data["start"] // 1000,)
                 for entry in result.logs
                 if entry.msg == "done" and entry.addr.name.startswith("client")
             ],
-            schema=["epoch", "duration", "retries"],
+            schema=["epoch"],
             orient="row",
         )
         .group_by("epoch", maintain_order=True)
-        .agg(pl.col("*").mean())
-    )
-    task_times = task_times.with_columns(
-        pl.Series(
-            name="duration",
-            values=np.convolve(
-                task_times["duration"].to_numpy(),
-                np.ones(avg_window) / avg_window,
-            )[: len(task_times)],
+        .agg(pl.len().alias("completed"))
+        .join(
+            pl.DataFrame().with_columns(pl.arange(0, max_epoch_s).alias("epoch")),
+            on="epoch",
+            how="right",
         )
-    )
-    task_times = task_times.with_columns(
-        pl.arange(0, len(task_times)).alias("completed")
-    )
-
-    goodput = (
-        pl.DataFrame()
+        .fill_null(0)
+        .with_columns(pl.col("completed").cum_sum().alias("completed"))
         .with_columns(
-            pl.arange(0, max(e.epoch for e in result.logs) // 1000 + 1).alias("epoch")
-        )
-        .join(task_times, on="epoch", how="left", maintain_order="left")
-        .select("epoch", "completed")
-        .with_columns(pl.col("completed").fill_null(strategy="forward").fill_null(0))
-    )
-    goodput = goodput.with_columns(
-        pl.Series(
-            name="completed",
-            values=np.convolve(
-                goodput["completed"].to_numpy(),
-                np.ones(avg_window * 3) / (avg_window * 3),
-            )[: len(goodput)],
+            (pl.col("completed").diff() / pl.col("epoch").diff()).alias("goodput")
         )
     )
     goodput = goodput.with_columns(
-        pl.col("completed").diff().fill_null(0).alias("goodput")
+        smooth_series(goodput.get_column("goodput"), avg_window=avg_window)
     )
 
     queue_size = (
@@ -638,19 +613,13 @@ def experiment2():
         .agg(pl.col("size").mean())
     )
     queue_size = queue_size.with_columns(
-        pl.Series(
-            name="size",
-            values=np.convolve(
-                queue_size["size"].to_numpy(),
-                np.ones(avg_window) / avg_window,
-            )[: len(queue_size)],
-        )
+        smooth_series(queue_size.get_column("size"), avg_window=avg_window)
     )
 
     sends = (
         pl.DataFrame(
             [
-                (entry.epoch // 10000)
+                (entry.epoch // 3000)
                 for entry in result.logs
                 if entry.addr.name.startswith("client") and entry.msg == "submit"
             ],
@@ -659,32 +628,27 @@ def experiment2():
         )
         .group_by("epoch", maintain_order=True)
         .agg(pl.len().alias("sends"))
-        .with_columns(pl.col("epoch") * 10)
+        .with_columns(pl.col("epoch") * 3)
     )
-
-    full = (
-        pl.DataFrame(
-            [
-                (entry.epoch // 1000)
-                for entry in result.logs
-                if entry.data.get("reason") == "full"
-            ],
-            schema=["epoch"],
-            orient="row",
-        )
-        .group_by("epoch", maintain_order=True)
-        .agg(pl.len().alias("fulls"))
+    sends = sends.with_columns(
+        smooth_series(sends.get_column("sends"), avg_window=avg_window)
     )
 
     retries = (
         pl.DataFrame(
-            [(entry.epoch // 1000) for entry in result.logs if entry.msg == "retry"],
+            [(entry.epoch // 3000) for entry in result.logs if entry.msg == "retry"],
             schema=["epoch"],
             orient="row",
         )
         .group_by("epoch", maintain_order=True)
         .agg(pl.len().alias("retries"))
+        .with_columns(pl.col("epoch") * 3)
     )
+    retries = retries.join(
+        pl.DataFrame().with_columns(pl.arange(0, max_epoch_s).alias("epoch")),
+        on="epoch",
+        how="right",
+    ).fill_null(0)
     retries = retries.with_columns(
         smooth_series(retries.get_column("retries"), avg_window=avg_window)
     )
@@ -693,31 +657,43 @@ def experiment2():
     fig.suptitle("Metrics")
     fig.tight_layout()
 
-    grid = (2, 3)
+    grid = (2, 2)
 
-    # ax1 = fig.add_subplot(*grid, 1)
-    # ax1.set_title("Average Task Duration")
-    # ax1.plot(task_times["epoch"], task_times["duration"], linewidth=1)
+    ax1 = fig.add_subplot(*grid, 1)
+    ax1.set_title("Completed Tasks and Goodput")
+    ax1.plot(
+        goodput["epoch"],
+        goodput["completed"],
+        label="Completed Tasks",
+        color="orange",
+        linewidth=1,
+    )
+    ax1.set_ylabel("Completed Tasks")
+    ax1b = ax1.twinx()
+    ax1b.plot(
+        goodput["epoch"], goodput["goodput"], label="Goodput", color="teal", linewidth=1
+    )
+    ax1b.set_ylabel("Goodput (Tasks per UT)")
+    ax1.legend(loc="upper right")
+    ax1b.legend(loc="lower right")
 
-    ax2 = fig.add_subplot(*grid, 2)
-    ax2.set_title("Total Completed Tasks")
-    ax2.plot(goodput["epoch"], goodput["completed"], linewidth=1)
-
-    ax3 = fig.add_subplot(*grid, 3)
-    ax3.set_title("Average Queue Size")
+    ax3 = fig.add_subplot(*grid, 2)
+    ax3.set_title("Queue Size")
     ax3.plot(queue_size["epoch"], queue_size["size"], linewidth=1)
 
-    ax4 = fig.add_subplot(*grid, 4)
-    ax4.set_title("Goodput (Tasks per Second)")
-    ax4.plot(goodput["epoch"], goodput["goodput"], linewidth=1)
-
-    ax5 = fig.add_subplot(*grid, 5)
-    ax5.set_title("Task Retries")
-    ax5.plot(retries["epoch"], retries["retries"], linewidth=1)
-
-    ax6 = fig.add_subplot(*grid, 6)
-    ax6.set_title("Sends per Second")
-    ax6.plot(sends["epoch"], sends["sends"], linewidth=1)
+    ax5 = fig.add_subplot(*grid, 3)
+    ax5.set_title("Task Retries and Sends per UT")
+    ax5.plot(
+        retries["epoch"], retries["retries"], label="Retries", color="pink", linewidth=1
+    )
+    ax5.set_ylabel("Retries")
+    ax5b = ax5.twinx()
+    ax5b.plot(
+        sends["epoch"], sends["sends"], label="Sends", color="purple", linewidth=1
+    )
+    ax5b.set_ylabel("Sends per UT")
+    ax5.legend(loc="upper right")
+    ax5b.legend(loc="lower right")
 
     plt.show(block=True)
 
