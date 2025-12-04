@@ -101,7 +101,7 @@ class Ref:
     # created_by: Addr | None = field(default_factory=created_by_default)
 
     def __repr__(self) -> str:
-        return f"{type(self).__name__}({str(self.uuid)!r}"
+        return f"{type(self).__name__}({str(self.uuid)!r})"
 
 
 class _AtomMeta(type):
@@ -755,6 +755,23 @@ async def ask_timeout(
         return msg.args[1]
     else:
         raise Timeout(f"Timed out after {timeout} epochs")
+
+
+async def wait_timeout(timeout: int, *args: Any, **kwargs: Any) -> tuple[Any, ...]:
+    timeout_ref = Ref()
+    send_scheduled(now() + timeout, self(), timeout_ref, hint="timeout")
+    result, message = await _wait_inner(
+        SelectionMatcher(
+            SingleMatcher(args, kwargs),
+            _FusedRefSelect((timeout_ref,)),
+        )
+    )
+    if message.args and message.args[0] == timeout_ref:
+        _self_node().set_drop_hint(SingleMatcher(args, kwargs))
+        raise Timeout(f"Timed out after {timeout} epochs")
+    _self_node().set_drop_hint(_FusedRefSelect((timeout_ref,)))
+    message = _filter_message(message, result)
+    return *message.args, message.kwargs
 
 
 class Loop(Atom): ...
