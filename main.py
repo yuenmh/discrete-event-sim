@@ -51,6 +51,7 @@ def experiment2(
     retry_delay: int = 100,
     inter_sleep: int = 4000,
     trigger_delay: int = 1_000_000,
+    seed: int = 0,
 ):
     this = self
 
@@ -117,7 +118,7 @@ def experiment2(
         for _ in range(20):
             await worker.submit(Ref(), timeout=50)
 
-    el = EventLoop()
+    el = EventLoop(seed=seed)
     el.spawn(queue_addr, Queue.create(max_size=20))
     el.spawn(Addr("worker"), worker_process)
     el.spawn(Addr("client"), client)
@@ -256,8 +257,9 @@ def experiment2(
 
 
 def main():
-    fig = experiment2()
-    fig.savefig("experiment2.png")
+    for seed in range(10):
+        fig = experiment2(seed=seed)
+        fig.savefig(f"results/experiment-{seed:02}.png")
 
 
 if __name__ == "__main__":

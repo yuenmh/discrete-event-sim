@@ -596,7 +596,7 @@ class Event:
 
 
 class EventLoop:
-    def __init__(self):
+    def __init__(self, seed: int | None = None):
         self.nodes = dict[Addr, Node]()
         self.fuel_per_epoch = 100
         self.logs: list[LogEntry] = []
@@ -604,6 +604,7 @@ class EventLoop:
         self.epoch = 0
         self.rngs = dict[Addr, Random]()
         self.event_queue = PriorityQueue[Event](key=lambda event: event.delivery_epoch)
+        self.seed = str(seed) if seed else ""
 
     def spawn(
         self,
@@ -613,7 +614,9 @@ class EventLoop:
         node = Node(init.sm)
         node.inbox.extend(init.messages)
         self.nodes[addr] = node
-        self.rngs[addr] = Random(hashlib.sha256(addr.name.encode()).digest())
+        self.rngs[addr] = Random(
+            hashlib.sha256(f"{addr.name}{self.seed}".encode()).digest()
+        )
 
     def run(self, epochs: int = 1):
         while True:
