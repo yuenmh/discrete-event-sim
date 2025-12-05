@@ -1,6 +1,10 @@
+import random
+from typing import TYPE_CHECKING
+
 import matplotlib.pyplot as plt
 import numpy as np
 import polars as pl
+from tqdm import tqdm
 
 from des.sim import (
     Addr,
@@ -18,6 +22,9 @@ from des.sim import (
     wait_timeout,
 )
 from des.stdlib import Queue
+
+if TYPE_CHECKING:
+    from matplotlib.axes import Axes
 
 
 def constant_retry(wait_time: int):
@@ -211,6 +218,20 @@ def experiment2(
         smooth_series(retries.get_column("retries"), avg_window=avg_window)
     )
 
+    return {
+        "goodput": goodput,
+        "queue_size": queue_size,
+        "sends": sends,
+        "retries": retries,
+    }
+
+
+def plot_single_run_metrics(metrics: dict[str, pl.DataFrame]):
+    goodput = metrics["goodput"]
+    queue_size = metrics["queue_size"]
+    sends = metrics["sends"]
+    retries = metrics["retries"]
+
     fig = plt.figure(figsize=(18, 8))
     fig.suptitle("Metrics")
     fig.tight_layout()
@@ -256,10 +277,64 @@ def experiment2(
     return fig
 
 
+def metastable_comparison_plot():
+    rng = random.Random(1)
+    results = []
+    for i in tqdm(range(20)):
+        delay = rng.randrange(0, 3_000_000)
+        result = experiment2(timeout=1910, trigger_delay=delay, seed=i)
+        results.append(result)
+
+    rng = random.Random(1)
+    convergent_results = []
+    for i in tqdm(range(20)):
+        delay = rng.randrange(0, 3_000_000)
+        result = experiment2(work_time=800, timeout=1910, trigger_delay=delay, seed=i)
+        convergent_results.append(result)
+
+    def plot_metrics(ax1: Axes, ax2: Axes, results: list[dict[str, pl.DataFrame]]):
+        ax1.set_title("Number of completed tasks across trials")
+        ax1.set_xlabel("time")
+        ax1.set_ylabel("completed tasks")
+        for result in results:
+            ax1.plot(
+                result["goodput"]["epoch"],
+                result["goodput"]["completed"],
+                alpha=0.3,
+                linewidth=1,
+            )
+
+        ax2.set_title("Queue size across trials")
+        ax2.set_xlabel("time")
+        ax2.set_ylabel("queue size")
+        for result in results:
+            ax2.plot(
+                result["queue_size"]["epoch"],
+                result["queue_size"]["size"],
+                alpha=0.3,
+                linewidth=1,
+            )
+
+    fig = plt.figure(figsize=(14, 10))
+    figs = fig.subfigures(2, 1)
+    figs[0].suptitle("Metastable")
+    plot_metrics(
+        figs[0].add_subplot(1, 2, 1),
+        figs[0].add_subplot(1, 2, 2),
+        results,
+    )
+    figs[1].suptitle("Not metastable")
+    plot_metrics(
+        figs[1].add_subplot(1, 2, 1),
+        figs[1].add_subplot(1, 2, 2),
+        convergent_results,
+    )
+
+    return fig
+
+
 def main():
-    for seed in range(10):
-        fig = experiment2(seed=seed)
-        fig.savefig(f"results/experiment-{seed:02}.png")
+    metastable_comparison_plot().savefig("plots/metastable_comparison.png")
 
 
 if __name__ == "__main__":
