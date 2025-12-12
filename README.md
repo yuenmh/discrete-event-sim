@@ -42,7 +42,7 @@ This preloads the inbox with a message to start the process when you spawn it.
 ping_server_addr = ...
 
 @launch
-async def client_process():
+async def client():
     # demo of sending a ping and waiting for a response
     ref = Ref()
     send(ping_server_addr, Ping, self(), ref)
@@ -54,8 +54,16 @@ async def client_process():
 
 You can loop inside but there should probably be at least one `await` so it doesn't run forever.
 
-To run the simulation use the `EventLoop` class and spawn each process with `EventLoop.spawn(addr, sm)`.
+To run the simulation use the `EventLoop` class and spawn each process with `EventLoop.spawn(addr, sm)`,
+where `sm` is the thing returned by `SMBuilder` and what `launch` turns the function into.
 Then run with `EventLoop.run(num_epochs)` (you can decide like 1 epoch = 1ms).
+
+```python
+el = EventLoop(seed=1)
+el.spawn(Addr("ping_server"), ping_server)
+el.spawn(Addr("client1"), client)
+el.run(100_000)
+```
 
 ## Working api for now
 
