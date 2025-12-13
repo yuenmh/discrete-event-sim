@@ -77,7 +77,7 @@ Functions for sending and waiting are as follows:
 
 These functions get the state from a contextvar that the event loop manages. Others are:
 
-- `self()` or `this()`: probably a mistake originally naming it self but it gets the current process address.
+- `self()`: probably a mistake naming it self and should be renamed to `this`. Gets the current process address.
 - `rng()`, `now()`, `stop()`, `sleep()`, `sleep_until()`: self explanatory
 - `log(msg, **kwargs)` is currently the main way of calculating statistics. The pattern I have been using is to pick
   a unique name for each type of event and then filter the log after and put the values into a dataframe to analyze.
