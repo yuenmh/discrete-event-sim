@@ -83,54 +83,80 @@ def experiment2(
 
     worker = Worker(queue_addr)
 
-    @launch
-    async def worker_process():
-        while True:
-            addr, ref = await queue.dequeue()
-            await sleep(
-                work_time - work_time_rand + int(rng().expovariate(1 / work_time_rand))
-            )
-            send(addr, ref, hint="done")
+    def create_worker():
+        @launch
+        async def worker_process():
+            while True:
+                addr, ref = await queue.dequeue()
+                await sleep(
+                    work_time
+                    - work_time_rand
+                    + int(rng().expovariate(1 / work_time_rand))
+                )
+                send(addr, ref, hint="done")
 
-    @launch
-    async def client():
-        while True:
-            retries = 0
-            start = now()
-            ref = Ref()
-            while not await worker.submit(ref, timeout=timeout):
-                retries += 1
-                log("retry", ref=ref, retries=retries)
-                await sleep(retry_delay)
-            log("done", ref=ref, retries=retries, start=start, duration=now() - start)
-            await sleep(inter_sleep)
+        return worker_process
 
-    @launch
-    async def client2():
-        await sleep(200)
-        while True:
-            retries = 0
-            start = now()
-            ref = Ref()
-            while not await worker.submit(ref, timeout=timeout):
-                retries += 1
-                log("retry", ref=ref, retries=retries)
-                await sleep(retry_delay)
-            log("done", ref=ref, retries=retries, start=start, duration=now() - start)
-            await sleep(inter_sleep)
+    def create_client():
+        @launch
+        async def client():
+            while True:
+                retries = 0
+                start = now()
+                ref = Ref()
+                while not await worker.submit(ref, timeout=timeout):
+                    retries += 1
+                    log("retry", ref=ref, retries=retries)
+                    await sleep(retry_delay)
+                log(
+                    "done",
+                    ref=ref,
+                    retries=retries,
+                    start=start,
+                    duration=now() - start,
+                )
+                await sleep(inter_sleep)
 
-    @launch
-    async def trigger():
-        await sleep(trigger_delay)
-        for _ in range(20):
-            await worker.submit(Ref(), timeout=50)
+        return client
+
+    def create_client2():
+        @launch
+        async def client2():
+            await sleep(200)
+            while True:
+                retries = 0
+                start = now()
+                ref = Ref()
+                while not await worker.submit(ref, timeout=timeout):
+                    retries += 1
+                    log("retry", ref=ref, retries=retries)
+                    await sleep(retry_delay)
+                log(
+                    "done",
+                    ref=ref,
+                    retries=retries,
+                    start=start,
+                    duration=now() - start,
+                )
+                await sleep(inter_sleep)
+
+        return client2
+
+    def create_trigger():
+        @launch
+        async def trigger():
+            await sleep(trigger_delay)
+            for _ in range(20):
+                await worker.submit(Ref(), timeout=50)
+
+        return trigger
 
     el = EventLoop(seed=seed)
-    el.spawn(queue_addr, Queue.create(max_size=20))
-    el.spawn(Addr("worker"), worker_process)
-    el.spawn(Addr("client"), client)
-    el.spawn(Addr("client2"), client2)
-    el.spawn(Addr("trigger"), trigger)
+    el.spawn(queue_addr, lambda: Queue.create(max_size=20))
+    el.spawn(Addr("worker"), create_worker)
+    el.spawn(Addr("client"), create_client)
+    el.spawn(Addr("client2"), create_client2)
+    el.spawn(Addr("trigger"), create_trigger)
     result = el.run(epochs=3_000_000)
 
     max_epoch_s = max(e.epoch for e in result.logs) // 1000 + 1

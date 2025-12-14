@@ -1,9 +1,8 @@
-import hashlib
 import heapq
 import inspect
-import sqlite3
 import types
 import warnings
+from collections import deque
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, field, replace
@@ -20,6 +19,7 @@ from typing import (
     Protocol,
     Self,
     Sequence,
+    assert_never,
     cast,
 )
 from uuid import UUID, uuid4
@@ -207,11 +207,13 @@ class SelectionMatcher(Matcher):
 
 class Context(Protocol):
     @property
-    def event_loop(self) -> EventLoop: ...
-    @property
     def self_addr(self) -> Addr: ...
     @property
     def sent_messages(self) -> list[Event]: ...
+    @property
+    def self_node(self) -> Process: ...
+    def current_epoch(self) -> int: ...
+    def append_log(self, log: LogEntry): ...
 
 
 class StateMachine(Protocol):
@@ -415,9 +417,26 @@ def async_transition(continuation: StateMachine):
 
 @dataclass
 class ContextImpl:
-    event_loop: EventLoop
-    self_addr: Addr
+    _current_epoch: int
+    _self_addr: Addr
     sent_messages: list[Event]
+    self_node: Process
+    logs: list[LogEntry] = field(default_factory=list)
+
+    num_now_calls: int = 0
+    num_self_calls: int = 0
+
+    def current_epoch(self):
+        self.num_now_calls += 1
+        return self._current_epoch
+
+    @property
+    def self_addr(self) -> Addr:
+        self.num_self_calls += 1
+        return self._self_addr
+
+    def append_log(self, log: LogEntry):
+        self.logs.append(log)
 
 
 class _LeakDetector:
@@ -437,64 +456,189 @@ class _LeakDetector:
         return self.ema_diff > self.threshold
 
 
-class Node:
-    def __init__(self, sm: StateMachine):
-        self.sm = sm
-        self.inbox: list[Message] = []
-        self.drop_hints: list[Matcher] = []
-        self.fuel_per_epoch: int | None = None
-        self.unlimited_fuel = True
-        self.stopped = False
-        self._detector = _LeakDetector(alpha=0.09, threshold=0.1)
-        self._addr = None
+class StateMarker:
+    uuid: UUID = field(default_factory=uuid4)
 
-    def run(self, fuel: int, self_addr: Addr, event_loop: EventLoop) -> list[Event]:
-        self._addr = self_addr
-        if self.stopped:
-            return []
-        ctx = ContextImpl(event_loop=event_loop, self_addr=self_addr, sent_messages=[])
-        if self.unlimited_fuel:
-            range_ = iter(int, 1)
+
+class CloneContext:
+    def __init__(
+        self,
+        current_epoch_log: EffectLogRead[int],
+        self_addr_log: EffectLogRead[Addr],
+        self_node: Process,
+    ):
+        self.sent_messages: list[Event] = []
+        self.current_epoch_log = current_epoch_log
+        self.self_addr_log = self_addr_log
+        self.self_node = self_node
+
+    @property
+    def self_addr(self) -> Addr:
+        result = self.self_addr_log.pop()
+        if result is None:
+            raise RuntimeError("Inconsistent access pattern during cloning")
+        self.self_node._self_addr_log.append(result)
+        return result
+
+    def current_epoch(self) -> int:
+        result = self.current_epoch_log.pop()
+        if result is None:
+            raise RuntimeError("Inconsistent access pattern during cloning")
+        self.self_node._current_epoch_log.append(result)
+        return result
+
+    def append_log(self, log: LogEntry):
+        del log  # unused
+        pass
+
+
+class EffectLogWrite[T]:
+    def __init__(self):
+        self._entries: list[tuple[T, int]] = []
+
+    def append(self, entry: T, times: int = 1):
+        if times <= 0:
+            return
+        if self._entries and self._entries[-1][0] == entry:
+            last_entry, last_times = self._entries[-1]
+            self._entries[-1] = (last_entry, last_times + times)
+        self._entries.append((entry, times))
+
+    def to_reader(self) -> EffectLogRead[T]:
+        reader = EffectLogRead[T]()
+        reader._entries = deque(self._entries)
+        return reader
+
+
+class EffectLogRead[T]:
+    def __init__(self):
+        self._entries = deque[tuple[T, int]]()
+
+    def pop(self) -> T | None:
+        if not self._entries:
+            return None
+        entry, times = self._entries[0]
+        if times > 1:
+            self._entries[0] = (entry, times - 1)
         else:
-            range_ = range(fuel)
-        for _ in range_:
-            result = next_state(self.sm, ctx=ctx, msgs=self.inbox)
+            self._entries.popleft()
+        return entry
+
+
+class Process:
+    def __init__(
+        self, sm_factory: Callable[[], StateMachineInit], seed: int | str | bytes
+    ):
+        self._factory = sm_factory
+        init = sm_factory()
+        self._sm = init.sm
+        self._inbox: list[Message] = [*init.messages]
+        self._drop_hints: list[Matcher] = []
+        self._stopped = False
+        self._detector = _LeakDetector(alpha=0.09, threshold=0.1)
+        self._init_seed = seed
+        self._rng = Random(seed)
+        self._event_log: list[Message | Seed | StateMarker] = []
+        self._current_epoch_log = EffectLogWrite[int]()
+        self._self_addr_log = EffectLogWrite[Addr]()
+        self._log: list[LogEntry] = []
+
+    def run(
+        self, self_addr: Addr, event_loop: EventLoop
+    ) -> tuple[list[Event], list[LogEntry]]:
+        if self._stopped:
+            return [], []
+        ctx = ContextImpl(
+            _current_epoch=event_loop.epoch,
+            _self_addr=self_addr,
+            sent_messages=[],
+            self_node=self,
+        )
+        while True:
+            result = next_state(self._sm, ctx=ctx, msgs=self._inbox)
             if result is not None:
                 i, next_sm = result
-                self.sm = next_sm
-                self.inbox.pop(i)
+                self._sm = next_sm
+                msg = self._inbox.pop(i)
+                self._event_log.append(msg)
             else:
                 break
-        self._analyze_inbox_growth()
-        return ctx.sent_messages
+        self._analyze_inbox_growth(self_addr)
+        self._current_epoch_log.append(event_loop.epoch, times=ctx.num_now_calls)
+        self._self_addr_log.append(self_addr, times=ctx.num_self_calls)
+        return ctx.sent_messages, ctx.logs
 
-    def _analyze_inbox_growth(self):
-        self._detector.update(len(self.inbox))
+    def _analyze_inbox_growth(self, addr: Addr):
+        self._detector.update(len(self._inbox))
         if self._detector.is_leaking():
-            warnings.warn(f"{self._addr} inbox growing. size={len(self.inbox)}")
-            print(self.inbox, self.sm.matcher)
+            warnings.warn(f"{addr} inbox growing. size={len(self._inbox)}")
+            print(self._inbox, self._sm.matcher)
+
+    def seed_rng(self, seed: int | str | bytes):
+        self._event_log.append(Seed(seed))
+        self._rng.seed(seed)
 
     def deliver(self, msg: Message):
-        if self.stopped:
+        if self._stopped:
             return
-        for i, hint in enumerate(self.drop_hints):
+        for i, hint in enumerate(self._drop_hints):
             if hint.match(msg):
-                self.drop_hints.pop(i)
+                self._drop_hints.pop(i)
                 return
-        self.inbox.append(msg)
+        self._inbox.append(msg)
 
     def set_drop_hint(self, matcher: Matcher):
-        for i, msg in enumerate(self.inbox):
+        for i, msg in enumerate(self._inbox):
             if matcher.match(msg):
-                self.inbox.pop(i)
+                self._inbox.pop(i)
                 return
-        self.drop_hints.append(matcher)
+        self._drop_hints.append(matcher)
 
+    def add_marker(self, marker: StateMarker | None = None) -> StateMarker:
+        if marker is None:
+            marker = StateMarker()
+        self._event_log.append(marker)
+        return marker
 
-@dataclass
-class DataPoint:
-    epoch: int
-    data: dict[tuple[Addr, str], Any]
+    def clone(self, marker: StateMarker | None = None) -> Process:
+        new_process = Process(self._factory, seed=self._init_seed)
+        new_process._inbox.clear()
+        if marker is None:
+            events = self._event_log
+        else:
+            try:
+                index = self._event_log.index(marker) + 1
+            except ValueError:
+                raise ValueError("Marker not found in event log") from None
+            events = self._event_log[:index]
+        for event in events:
+            match event:
+                case Seed(data):
+                    new_process.seed_rng(data)
+                case Message():
+                    if next := next_state(
+                        new_process._sm,
+                        ctx=CloneContext(
+                            current_epoch_log=self._current_epoch_log.to_reader(),
+                            self_addr_log=self._self_addr_log.to_reader(),
+                            self_node=new_process,
+                        ),
+                        msgs=[event],
+                    ):
+                        _, next_sm = next
+                        new_process._sm = next_sm
+                    else:
+                        raise RuntimeError(
+                            "Inconsistent state during cloning: message could not be delivered"
+                        )
+
+                case StateMarker():
+                    if event == marker:
+                        break
+                case _:
+                    assert_never(event)
+        new_process._event_log = events.copy()
+        return new_process
 
 
 @dataclass(frozen=True, slots=True)
@@ -520,26 +664,6 @@ class LogEntry:
 class RunResult:
     logs: list[LogEntry]
     num_epochs: int
-
-    def logs_sqlite(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(":memory:")
-        conn.execute(
-            """
-            CREATE TABLE log (
-                epoch INTEGER,
-                addr TEXT,
-                msg TEXT,
-                data TEXT
-            )
-            """
-        )
-        for log in self.logs:
-            conn.execute(
-                "INSERT INTO log (epoch, addr, msg, data) VALUES (?, ?, ?, ?)",
-                (log.epoch, log.addr.name, log.msg, repr(log.data)),
-            )
-        conn.commit()
-        return conn
 
 
 @dataclass(slots=True)
@@ -587,38 +711,44 @@ class PriorityQueue[T]:
     def __bool__(self) -> bool:
         return bool(self._items)
 
+    def copy(self) -> PriorityQueue[T]:
+        """Return a shallow copy of the priority queue."""
+        new_pq = PriorityQueue(key=self._key)
+        new_pq._items = self._items.copy()
+        return new_pq
+
+
+@dataclass
+class Seed:
+    data: int | str | bytes
+
 
 @dataclass
 class Event:
     recipient: Addr
     delivery_epoch: int
-    message: Message
+    payload: Message | Seed
 
 
 class EventLoop:
-    def __init__(self, seed: int | None = None):
-        self.nodes = dict[Addr, Node]()
-        self.fuel_per_epoch = 100
+    def __init__(self, seed: int | str | None = None):
+        self.nodes = dict[Addr, Process]()
         self.logs: list[LogEntry] = []
-        self.new_logs: list[LogEntry] = []
         self.epoch = 0
-        self.rngs = dict[Addr, Random]()
         self.event_queue = PriorityQueue[Event](key=lambda event: event.delivery_epoch)
         self.seed = str(seed) if seed else ""
 
     def spawn(
         self,
         addr: Addr,
-        init: StateMachineInit,
+        init: Callable[[], StateMachineInit],
     ):
-        node = Node(init.sm)
-        node.inbox.extend(init.messages)
+        node = Process(init, seed=f"{addr.name}{self.seed}")
         self.nodes[addr] = node
-        self.rngs[addr] = Random(
-            hashlib.sha256(f"{addr.name}{self.seed}".encode()).digest()
-        )
+        return node
 
     def run(self, epochs: int = 1):
+        last_epoch = self.epoch
         while True:
             if self.epoch >= epochs:
                 break
@@ -632,42 +762,55 @@ class EventLoop:
                     node = self.nodes[event.recipient]
                 except KeyError:
                     raise RuntimeError(f"Send to unknown address: {event}")
-                node.deliver(event.message)
+                match event.payload:
+                    case Seed(data):
+                        node.seed_rng(data)
+                    case Message():
+                        node.deliver(event.payload)
 
             for addr, node in self.nodes.items():
-                self.event_queue.extend(
-                    node.run(
-                        fuel=node.fuel_per_epoch or self.fuel_per_epoch,
-                        self_addr=addr,
-                        event_loop=self,
-                    )
+                sent_msgs, new_logs = node.run(
+                    self_addr=addr,
+                    event_loop=self,
                 )
+                self.event_queue.extend(sent_msgs)
+                self.logs.extend(new_logs)
+
+            last_epoch = self.epoch
 
             if next_event := self.event_queue.peek():
                 self.epoch = max(self.epoch + 1, next_event.delivery_epoch)
             else:
                 break
-            self.commit_logs()
 
-        return RunResult(logs=self.logs, num_epochs=max(0, self.epoch - 1))
+        return RunResult(logs=self.logs, num_epochs=last_epoch)
 
-    def commit_logs(self):
-        self.logs.extend(self.new_logs)
-        self.new_logs.clear()
+    def clone(self) -> EventLoop:
+        new_loop = EventLoop(seed=self.seed)
+        new_loop.epoch = self.epoch
+        new_loop.logs = self.logs.copy()
+        new_loop.event_queue = self.event_queue.copy()
+        new_loop.nodes = {addr: node.clone() for addr, node in self.nodes.items()}
+        return new_loop
 
-    def append_log(self, log: LogEntry):
-        self.new_logs.append(log)
+    def find(self, addr: Addr | str) -> Process:
+        if isinstance(addr, str):
+            addr = Addr(addr)
+        try:
+            return self.nodes[addr]
+        except KeyError:
+            raise KeyError(f"Unknown address: {addr}")
 
 
 def send(addr: Addr, *args: Any, **kwargs: Any):
     context().sent_messages.append(
-        Event(recipient=addr, delivery_epoch=0, message=message(*args, **kwargs))
+        Event(recipient=addr, delivery_epoch=0, payload=message(*args, **kwargs))
     )
 
 
 def send_scheduled(at: int, addr: Addr, *args: Any, **kwargs: Any):
     context().sent_messages.append(
-        Event(recipient=addr, delivery_epoch=at, message=message(*args, **kwargs))
+        Event(recipient=addr, delivery_epoch=at, payload=message(*args, **kwargs))
     )
 
 
@@ -675,8 +818,8 @@ def self() -> Addr:
     return context().self_addr
 
 
-def _self_node() -> Node:
-    return context().event_loop.nodes[context().self_addr]
+def _self_node() -> Process:
+    return context().self_node
 
 
 @types.coroutine
@@ -704,15 +847,15 @@ async def _race_refs(*refs: Ref):
 def log(msg: str | None = None, /, **kwargs: Any):
     if msg is not None:
         kwargs["_msg"] = msg
-    context().event_loop.append_log(LogEntry(epoch=now(), addr=self(), data=kwargs))
+    context().append_log(LogEntry(epoch=now(), addr=self(), data=kwargs))
 
 
 def now() -> int:
-    return context().event_loop.epoch
+    return context().current_epoch()
 
 
 def rng() -> Random:
-    return context().event_loop.rngs[self()]
+    return _self_node()._rng
 
 
 async def ask(addr: Addr, method: Any, *args: Any, **kwargs: Any) -> Any:
@@ -723,7 +866,7 @@ async def ask(addr: Addr, method: Any, *args: Any, **kwargs: Any) -> Any:
 
 
 def stop():
-    _self_node().stopped = True
+    _self_node()._stopped = True
 
 
 class _FusedRefSelect:
