@@ -527,10 +527,24 @@ class EffectLogRead[T]:
 
 class Process:
     def __init__(
-        self, sm_factory: Callable[[], StateMachineInit], seed: int | str | bytes
+        self,
+        factory_or_sm: Callable[[], StateMachineInit] | StateMachineInit,
+        seed: int | str | bytes,
     ):
-        self._factory = sm_factory
-        init = sm_factory()
+        if callable(factory_or_sm):
+            self._factory = factory_or_sm
+        elif hasattr(factory_or_sm, "clone_initial_state"):
+            self._factory = getattr(factory_or_sm, "clone_initial_state")
+        else:
+
+            def _error_factory():
+                raise TypeError("Provided StateMachineInit is not clonable")
+
+            self._factory = _error_factory
+        if callable(factory_or_sm):
+            init = factory_or_sm()
+        else:
+            init = factory_or_sm
         self._sm = init.sm
         self._inbox: list[Message] = [*init.messages]
         self._drop_hints: list[Matcher] = []
@@ -741,7 +755,7 @@ class EventLoop:
     def spawn(
         self,
         addr: Addr,
-        init: Callable[[], StateMachineInit],
+        init: Callable[[], StateMachineInit] | StateMachineInit,
     ):
         node = Process(init, seed=f"{addr.name}{self.seed}")
         self.nodes[addr] = node

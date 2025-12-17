@@ -1,5 +1,4 @@
 from dataclasses import dataclass
-from functools import partial
 
 from .sim import (
     Addr,
@@ -52,8 +51,8 @@ def test_simple():
     adder_addr = Addr("adder")
 
     event_loop = EventLoop()
-    event_loop.spawn(adder_addr, make_adder)
-    event_loop.spawn(Addr("main"), partial(make_main, adder_addr))
+    event_loop.spawn(adder_addr, make_adder())
+    event_loop.spawn(Addr("main"), make_main(adder_addr))
     event_loop.run(epochs=50)
 
     for entry in event_loop.logs:
@@ -87,9 +86,9 @@ def test_producer_consumer():
     queue_addr = Addr("queue")
 
     event_loop = EventLoop()
-    event_loop.spawn(queue_addr, partial(Queue.create, max_size=30))
-    event_loop.spawn(Addr("producer"), partial(make_producer, Queue(queue_addr)))
-    event_loop.spawn(Addr("consumer"), partial(make_consumer, Queue(queue_addr)))
+    event_loop.spawn(queue_addr, Queue.create(max_size=30))
+    event_loop.spawn(Addr("producer"), make_producer(Queue(queue_addr)))
+    event_loop.spawn(Addr("consumer"), make_consumer(Queue(queue_addr)))
 
     event_loop.run(epochs=100)
 
@@ -103,26 +102,20 @@ def test_producer_consumer():
 
 
 def test_timeout():
-    def create_do_nothing():
-        @loop
-        async def do_nothing():
-            await sleep(200)
+    @loop
+    async def do_nothing():
+        await sleep(200)
 
-        return do_nothing
-
-    def create_main():
-        @launch
-        async def main():
-            try:
-                await ask_timeout(10, Addr("do_nothing"), None)
-            except TimeoutError:
-                log("timed out")
-
-        return main
+    @launch
+    async def main():
+        try:
+            await ask_timeout(10, Addr("do_nothing"), None)
+        except TimeoutError:
+            log("timed out")
 
     event_loop = EventLoop()
-    event_loop.spawn(Addr("do_nothing"), create_do_nothing)
-    event_loop.spawn(Addr("main"), create_main)
+    event_loop.spawn(Addr("do_nothing"), do_nothing)
+    event_loop.spawn(Addr("main"), main)
     event_loop.run(epochs=50)
 
     assert any(
