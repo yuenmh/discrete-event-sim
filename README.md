@@ -88,8 +88,9 @@ There is a premade queue in `des.stdlib`. The `Queue` class is a wrapper around 
 
 ## Problems
 
-Big problem: there is no way of saving the state and resuming it later. This is because the state of all processes is stored
-in the call stack of coroutines, which as far as I know cannot be cloned or serialized. I am not entirely sure how to fix this.
+~Big problem: there is no way of saving the state and resuming it later. This is because the state of all processes is stored
+in the call stack of coroutines, which as far as I know cannot be cloned or serialized. I am not entirely sure how to fix this.~
+Fixed now!
 
 No way to spawn from inside a process. This might be good depending on how you look at it. A workaround is just spawn everything
 that is needed, and wake up at the predetermined time.
