@@ -1,4 +1,3 @@
-import random
 from typing import TYPE_CHECKING
 
 import matplotlib.pyplot as plt
@@ -10,6 +9,7 @@ from des.sim import (
     Addr,
     EventLoop,
     Ref,
+    RunResult,
     Timeout,
     ask,
     launch,
@@ -51,88 +51,7 @@ def smooth_series(series: pl.Series, avg_window: int) -> pl.Series:
     )
 
 
-def experiment2(
-    work_time: int = 1000,
-    work_time_rand: int = 200,
-    timeout: int = 1900,
-    retry_delay: int = 100,
-    inter_sleep: int = 4000,
-    trigger_delay: int = 1_000_000,
-    seed: int = 0,
-):
-    this = self
-
-    queue_addr = Addr("queue")
-    queue = Queue[tuple[Addr, Ref]](queue_addr)
-
-    class Worker:
-        def __init__(self, addr: Addr):
-            self.queue_addr = addr
-
-        async def submit(self, ref: Ref, timeout: int) -> bool:
-            log("submit", ref=ref)
-            if await ask(self.queue_addr, Queue.Enqueue, (this(), ref)) is Queue.Full:
-                log("fail", ref=ref, reason="full")
-                return False
-            try:
-                await wait_timeout(timeout, ref)
-            except Timeout:
-                log("fail", ref=ref, reason="timeout")
-                return False
-            return True
-
-    worker = Worker(queue_addr)
-
-    @launch
-    async def worker_process():
-        while True:
-            addr, ref = await queue.dequeue()
-            await sleep(
-                work_time - work_time_rand + int(rng().expovariate(1 / work_time_rand))
-            )
-            send(addr, ref, hint="done")
-
-    @launch
-    async def client():
-        while True:
-            retries = 0
-            start = now()
-            ref = Ref()
-            while not await worker.submit(ref, timeout=timeout):
-                retries += 1
-                log("retry", ref=ref, retries=retries)
-                await sleep(retry_delay)
-            log("done", ref=ref, retries=retries, start=start, duration=now() - start)
-            await sleep(inter_sleep)
-
-    @launch
-    async def client2():
-        await sleep(200)
-        while True:
-            retries = 0
-            start = now()
-            ref = Ref()
-            while not await worker.submit(ref, timeout=timeout):
-                retries += 1
-                log("retry", ref=ref, retries=retries)
-                await sleep(retry_delay)
-            log("done", ref=ref, retries=retries, start=start, duration=now() - start)
-            await sleep(inter_sleep)
-
-    @launch
-    async def trigger():
-        await sleep(trigger_delay)
-        for _ in range(20):
-            await worker.submit(Ref(), timeout=50)
-
-    el = EventLoop(seed=seed)
-    el.spawn(queue_addr, Queue.create(max_size=20))
-    el.spawn(Addr("worker"), worker_process)
-    el.spawn(Addr("client"), client)
-    el.spawn(Addr("client2"), client2)
-    el.spawn(Addr("trigger"), trigger)
-    result = el.run(epochs=3_000_000)
-
+def analyze_data(result: RunResult):
     max_epoch_s = max(e.epoch for e in result.logs) // 1000 + 1
 
     avg_window = 10
@@ -226,6 +145,120 @@ def experiment2(
     }
 
 
+def experiment2(
+    work_time: int = 1000,
+    work_time_rand: int = 200,
+    timeout: int = 1900,
+    retry_delay: int = 100,
+    inter_sleep: int = 4000,
+    trigger_delay: int = 1_000_000,
+    seed: int = 0,
+):
+    this = self
+
+    queue_addr = Addr("queue")
+    queue = Queue[tuple[Addr, Ref]](queue_addr)
+
+    class Worker:
+        def __init__(self, addr: Addr):
+            self.queue_addr = addr
+
+        async def submit(self, ref: Ref, timeout: int) -> bool:
+            log("submit", ref=ref)
+            if await ask(self.queue_addr, Queue.Enqueue, (this(), ref)) is Queue.Full:
+                log("fail", ref=ref, reason="full")
+                return False
+            try:
+                await wait_timeout(timeout, ref)
+            except Timeout:
+                log("fail", ref=ref, reason="timeout")
+                return False
+            return True
+
+    worker = Worker(queue_addr)
+
+    def create_worker():
+        @launch
+        async def worker_process():
+            while True:
+                addr, ref = await queue.dequeue()
+                await sleep(
+                    work_time
+                    - work_time_rand
+                    + int(rng().expovariate(1 / work_time_rand))
+                )
+                send(addr, ref, hint="done")
+
+        return worker_process
+
+    def create_client():
+        @launch
+        async def client():
+            while True:
+                retries = 0
+                start = now()
+                ref = Ref()
+                while not await worker.submit(ref, timeout=timeout):
+                    retries += 1
+                    log("retry", ref=ref, retries=retries)
+                    await sleep(retry_delay)
+                log(
+                    "done",
+                    ref=ref,
+                    retries=retries,
+                    start=start,
+                    duration=now() - start,
+                )
+                await sleep(inter_sleep)
+
+        return client
+
+    def create_client2():
+        @launch
+        async def client2():
+            await sleep(200)
+            while True:
+                retries = 0
+                start = now()
+                ref = Ref()
+                while not await worker.submit(ref, timeout=timeout):
+                    retries += 1
+                    log("retry", ref=ref, retries=retries)
+                    await sleep(retry_delay)
+                log(
+                    "done",
+                    ref=ref,
+                    retries=retries,
+                    start=start,
+                    duration=now() - start,
+                )
+                await sleep(inter_sleep)
+
+        return client2
+
+    def create_trigger():
+        @launch
+        async def trigger():
+            await sleep(trigger_delay)
+            for _ in range(20):
+                await worker.submit(Ref(), timeout=50)
+
+        return trigger
+
+    el = EventLoop(seed=seed)
+    el.spawn(queue_addr, lambda: Queue.create(max_size=20))
+    el.spawn(Addr("worker"), create_worker)
+    el.spawn(Addr("client"), create_client)
+    el.spawn(Addr("client2"), create_client2)
+    el.spawn(Addr("trigger"), create_trigger)
+    el.run(trigger_delay + 1_000)
+
+    for seed in range(10):
+        new_el = el.clone()
+        new_el.seed_all(seed)
+        yield analyze_data(new_el.run(3_000_000))
+
+
 def plot_single_run_metrics(metrics: dict[str, pl.DataFrame]):
     goodput = metrics["goodput"]
     queue_size = metrics["queue_size"]
@@ -278,19 +311,7 @@ def plot_single_run_metrics(metrics: dict[str, pl.DataFrame]):
 
 
 def metastable_comparison_plot():
-    rng = random.Random(1)
-    results = []
-    for i in tqdm(range(20)):
-        delay = rng.randrange(0, 3_000_000)
-        result = experiment2(timeout=1910, trigger_delay=delay, seed=i)
-        results.append(result)
-
-    rng = random.Random(1)
-    convergent_results = []
-    for i in tqdm(range(20)):
-        delay = rng.randrange(0, 3_000_000)
-        result = experiment2(work_time=800, timeout=1910, trigger_delay=delay, seed=i)
-        convergent_results.append(result)
+    results = list(tqdm(experiment2(timeout=1910, seed=0), total=10))
 
     def plot_metrics(ax1: Axes, ax2: Axes, results: list[dict[str, pl.DataFrame]]):
         ax1.set_title("Number of completed tasks across trials")
@@ -311,30 +332,23 @@ def metastable_comparison_plot():
             ax2.plot(
                 result["queue_size"]["epoch"],
                 result["queue_size"]["size"],
-                alpha=0.3,
+                alpha=0.5,
                 linewidth=1,
             )
 
-    fig = plt.figure(figsize=(14, 10))
-    figs = fig.subfigures(2, 1)
-    figs[0].suptitle("Metastable")
+    fig = plt.figure(figsize=(16, 5))
     plot_metrics(
-        figs[0].add_subplot(1, 2, 1),
-        figs[0].add_subplot(1, 2, 2),
+        fig.add_subplot(1, 2, 1),
+        fig.add_subplot(1, 2, 2),
         results,
     )
-    figs[1].suptitle("Not metastable")
-    plot_metrics(
-        figs[1].add_subplot(1, 2, 1),
-        figs[1].add_subplot(1, 2, 2),
-        convergent_results,
-    )
+    fig.tight_layout()
 
     return fig
 
 
 def main():
-    metastable_comparison_plot().savefig("plots/metastable_comparison.png")
+    metastable_comparison_plot().savefig("plots/same_prefix_comparison.png", dpi=300)
 
 
 if __name__ == "__main__":
