@@ -11,8 +11,11 @@ from .sim import (
     launch,
     log,
     loop,
+    now,
+    rng,
     send,
     sleep,
+    sleep_until,
 )
 from .stdlib import Queue
 
@@ -118,3 +121,85 @@ def test_timeout():
     assert any(
         log.msg == "timed out" for log in event_loop.logs if log.addr.name == "main"
     )
+
+
+def test_clone_same_state():
+    def create_counter():
+        counter = SMBuilder()
+
+        value = 0
+
+        @counter.handle("inc")
+        async def handle_inc():
+            nonlocal value
+            value += 1
+
+        @counter.handle("get")
+        async def handle_get(sender: Addr, ref: Ref):
+            send(sender, ref, value)
+
+        return counter
+
+    counter_addr = Addr("counter")
+
+    def create_main():
+        @launch
+        async def main():
+            for _ in range(20):
+                send(counter_addr, "inc")
+                await sleep(10)
+
+            await sleep_until(100_000)
+
+            value = await ask(counter_addr, "get")
+            assert value == 20
+            log("done")
+
+        return main
+
+    event_loop = EventLoop()
+    event_loop.spawn(counter_addr, create_counter)
+    event_loop.spawn(Addr("main"), create_main)
+    event_loop.run(epochs=10_000)
+
+    el1 = event_loop.clone()
+    el2 = event_loop.clone()
+
+    res1 = el1.run(epochs=200_000)
+    assert res1.logs[-1].msg == "done"
+
+    res2 = el2.run(epochs=200_000)
+    assert res2.logs[-1].msg == "done"
+
+    assert res1.logs == res2.logs
+
+
+def test_clone_divergent_state():
+    def create_thing():
+        @launch
+        async def f():
+            count = 0
+            last = now()
+            while True:
+                await sleep(rng().randint(5, 15))
+                count += now() - last
+                last = now()
+                log(count=count)
+
+        return f
+
+    event_loop = EventLoop()
+    event_loop.spawn(Addr("thing"), create_thing)
+    event_loop.run(epochs=2000)
+
+    el1 = event_loop.clone()
+    el2 = event_loop.clone()
+    el1.find("thing").seed_rng(42)
+    el2.find("thing").seed_rng(42)
+
+    res_init = event_loop.run(epochs=4000)
+    res1 = el1.run(epochs=4000)
+    res2 = el2.run(epochs=4000)
+
+    assert res_init.logs != res1.logs
+    assert res1.logs == res2.logs
