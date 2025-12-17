@@ -801,6 +801,10 @@ class EventLoop:
         except KeyError:
             raise KeyError(f"Unknown address: {addr}")
 
+    def seed_all(self, seed: int | str):
+        for addr, node in self.nodes.items():
+            node.seed_rng(f"{addr.name}{seed}")
+
 
 def send(addr: Addr, *args: Any, **kwargs: Any):
     context().sent_messages.append(
