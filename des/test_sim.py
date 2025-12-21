@@ -6,8 +6,11 @@ from .sim import (
     EventLoop,
     Ref,
     SMBuilder,
+    StateMachineBase,
     ask,
     ask_timeout,
+    handle,
+    interface,
     launch,
     log,
     loop,
@@ -17,7 +20,7 @@ from .sim import (
     sleep,
     sleep_until,
 )
-from .stdlib import Queue
+from .stdlib import LaunchedStateMachine, Queue
 
 
 def test_simple():
@@ -203,3 +206,46 @@ def test_clone_divergent_state():
 
     assert res_init.logs != res1.logs
     assert res1.logs == res2.logs
+
+
+def test_class_based_counter():
+    class Counter(StateMachineBase):
+        def __init__(self, start: int = 0):
+            self.counter = start
+
+        @handle()
+        async def inc(self):
+            self.counter += 1
+
+        @handle()
+        async def get(self, sender: Addr, ref: Ref):
+            send(sender, ref, self.counter)
+
+    counter_addr = Addr("counter")
+    counter = interface(Counter, counter_addr)
+
+    class Main(LaunchedStateMachine):
+        async def start(self):
+            print("started")
+
+            for _ in range(20):
+                counter.inc()
+                await sleep(10)
+
+            await sleep_until(100_000)
+
+            value = await ask(counter_addr, Counter.get)
+            assert value == 20
+            log("done")
+
+    print()
+
+    event_loop = EventLoop()
+    event_loop.spawn(counter_addr, Counter())
+    event_loop.spawn(Addr("main"), Main())
+    event_loop.run(100)
+
+    cloned = event_loop.clone()
+
+    assert any(log.msg == "done" for log in event_loop.run(epochs=1_000_000).logs)
+    assert any(log.msg == "done" for log in cloned.run(epochs=1_000_000).logs)

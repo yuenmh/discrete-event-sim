@@ -2,7 +2,42 @@
 
 Dependencies are in the `pyproject.toml`, you can install normally or with uv.
 
-## Examples
+## Class based state machine
+
+After adding the ability to clone the entire state, I realized there needs to be a better way to group state and behavior
+than just storing it in stack frames.
+
+The stuff in Old Examples still works, but I think this is better.
+
+An example of a counter:
+
+```python
+class Counter(StateMachineBase):
+    def __init__(self, start: int = 0):
+        self.counter = start
+
+    @handle()
+    async def inc(self):
+        self.counter += 1
+
+    @handle()
+    async def get(self, sender: Addr, ref: Ref):
+        send(sender, ref, self.counter)
+```
+
+Then it can be used as follows:
+
+```python
+counter = interface(Counter, counter_addr)
+counter.inc()
+value = await ask(counter_addr, Counter.get)
+```
+
+`interface` creates a proxy object that sends messages to the process address. I still need to figure out an analogue for `ask`.
+An important design constraint is that this has to work with the old way because implemening queues/locks requires decoupled
+send and wait.
+
+## Old Examples
 
 Most of the stuff for creating protocols comes from `des.sim`.
 For creating a process that is like a server, use `SMBuilder` which is similar to the FastAPI builder
@@ -95,5 +130,6 @@ Fixed now!
 No way to spawn from inside a process. This might be good depending on how you look at it. A workaround is just spawn everything
 that is needed, and wake up at the predetermined time.
 
-I want to figure out a way to make the at least the send typesafe. Current ideas are to require properties with type annotations
-on the `Atom` subclasses, then check at runtime that all the required args are there; or maybe something can be done with `typing.ParamSpec`.
+~I want to figure out a way to make the at least the send typesafe. Current ideas are to require properties with type annotations
+on the `Atom` subclasses, then check at runtime that all the required args are there; or maybe something can be done with `typing.ParamSpec`.~
+Introduced class based state machines instead.

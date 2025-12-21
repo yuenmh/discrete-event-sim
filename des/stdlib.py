@@ -1,7 +1,19 @@
 from dataclasses import dataclass
 from typing import Any
 
-from .sim import Addr, Atom, Ref, SMBuilder, StateMachineInit, ask, log, send
+from .sim import (
+    Addr,
+    Atom,
+    Ref,
+    SMBuilder,
+    StateMachineBase,
+    StateMachineInit,
+    ask,
+    handle,
+    log,
+    message,
+    send,
+)
 
 __all__ = ["Ok", "Err", "Queue"]
 
@@ -59,3 +71,17 @@ class Queue[T]:
                 waiting.append((sender, ref))
 
         return queue
+
+
+class LaunchedStateMachine(StateMachineBase):
+    class Start(Atom): ...
+
+    __init_messages__ = (message(Start),)
+
+    @handle(Start)
+    async def _start(self):
+        await self.start()
+
+    async def start(self):
+        """Override to implement the launched state machine's behavior."""
+        raise NotImplementedError

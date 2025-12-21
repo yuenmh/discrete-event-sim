@@ -1,5 +1,6 @@
 import heapq
 import inspect
+import textwrap
 import types
 import warnings
 from collections import deque
@@ -16,6 +17,7 @@ from typing import (
     Generator,
     Iterable,
     Mapping,
+    ParamSpec,
     Protocol,
     Self,
     Sequence,
@@ -984,3 +986,110 @@ def launch(fn: Callable[..., Awaitable[None]]) -> StateMachineInit:
         await fn()
 
     return initialize(sm, message(None))
+
+
+@dataclass
+class _Branch:
+    match_args: tuple[Any, ...]
+    fn: Callable[..., Awaitable[None]]
+
+    def __call__(self, *args: Any, **kwargs: Any):
+        """stub call"""
+        pass
+
+    def __eq__(self, other: object) -> bool:
+        if isinstance(other, _Branch):
+            return self.fn == other.fn
+        if callable(other):
+            return self.fn == other
+        return False
+
+
+class _StateMachineBaseMeta(type):
+    def __new__(cls, name, bases, attrs: dict):
+        if "__init__" in attrs:
+            init = attrs["__init__"]
+
+            def init_wrapper(self, *args, **kwargs):
+                self.__init_args__ = (args, kwargs)
+                init(self, *args, **kwargs)
+
+            attrs["__init__"] = init_wrapper
+
+        branches = []
+        # Inherit branches from base classes
+        for base in bases:
+            if hasattr(base, "__branches__"):
+                branches.extend(getattr(base, "__branches__"))
+
+        for attr_name, attr_value in attrs.items():
+            if isinstance(attr_value, _Branch):
+                branches.append((attr_value.match_args, attr_value.fn))
+
+        attrs["__branches__"] = branches
+
+        attrs["__interface_cls__"] = _make_interface_class(
+            name=f"{name}Proxy",
+            methods={fn.__name__: match_args for match_args, fn in branches},
+        )
+        return super().__new__(cls, name, bases, attrs)
+
+
+class StubAwaitable:
+    def __await__(self):
+        return None
+
+
+def _make_interface_class(name: str, methods: dict[str, tuple[Any, ...]]):
+    namespace = {}
+
+    init_code = textwrap.dedent("""
+        def __init__(self, addr: Addr):
+            self.__addr__ = addr
+            self.__send__ = send
+    """)
+    locals = {}
+    exec(init_code, globals(), locals)
+    namespace["__init__"] = locals["__init__"]
+
+    for method_name, start_args in methods.items():
+        method_code = textwrap.dedent(f"""
+            def {method_name}(self, *args, **kwargs):
+                self.__send__(self.__addr__, *self.__{method_name}_args__, *args, **kwargs)
+                return StubAwaitable()
+        """)
+        locals = {}
+        exec(method_code, globals(), locals)
+        namespace[method_name] = locals[method_name]
+        namespace[f"__{method_name}_args__"] = start_args
+
+    return type(name, (object,), namespace)
+
+
+class StateMachineBase(metaclass=_StateMachineBaseMeta):
+    __init_messages__: Sequence[Message] = ()
+    """Override to provide initial messages to send on creation."""
+
+    def __call__(self) -> StateMachineInit:
+        state = self.__class__(
+            *getattr(self, "__init_args__", ((), ()))[0],
+            **getattr(self, "__init_args__", ((), {}))[1],
+        )
+
+        sm = SMBuilder()
+        for match_args, handler_fn in getattr(self, "__branches__"):
+            sm.handle(*match_args)(handler_fn.__get__(state))
+        return initialize(sm, *self.__init_messages__)
+
+
+def handle(*match_args: Any):
+    P = ParamSpec("P")
+
+    def decorator(fn: Callable[P, Awaitable[None]]) -> Callable[P, None]:
+        return _Branch(match_args=match_args or (fn,), fn=fn)
+
+    return decorator
+
+
+def interface[T: StateMachineBase](ty: type[T], addr: Addr):
+    return getattr(ty, "__interface_cls__")(addr)
