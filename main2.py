@@ -1,4 +1,4 @@
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -251,12 +251,19 @@ def experiment2(
     el.spawn(Addr("client"), create_client)
     el.spawn(Addr("client2"), create_client2)
     el.spawn(Addr("trigger"), create_trigger)
-    el.run(trigger_delay + 1_000)
+    reseed_time = trigger_delay + 100_000
+    el.run(reseed_time)
 
     for seed in range(10):
         new_el = el.clone()
         new_el.seed_all(seed)
-        yield analyze_data(new_el.run(3_000_000))
+        yield (
+            analyze_data(new_el.run(6_000_000)),
+            {
+                "reseed_time": reseed_time // 1000,
+                "trigger_time": trigger_delay // 1000,
+            },
+        )
 
 
 def plot_single_run_metrics(metrics: dict[str, pl.DataFrame]):
@@ -313,22 +320,39 @@ def plot_single_run_metrics(metrics: dict[str, pl.DataFrame]):
 def metastable_comparison_plot():
     results = list(tqdm(experiment2(timeout=1910, seed=0), total=10))
 
-    def plot_metrics(ax1: Axes, ax2: Axes, results: list[dict[str, pl.DataFrame]]):
+    def plot_metrics(
+        ax1: Axes,
+        ax2: Axes,
+        results: list[tuple[dict[str, pl.DataFrame], dict[str, Any]]],
+    ):
         ax1.set_title("Number of completed tasks across trials")
         ax1.set_xlabel("time")
         ax1.set_ylabel("completed tasks")
-        for result in results:
+        for result, _ in results:
             ax1.plot(
                 result["goodput"]["epoch"],
                 result["goodput"]["completed"],
                 alpha=0.3,
                 linewidth=1,
             )
+        ax1.axvline(
+            x=results[0][1]["trigger_time"],
+            color="green",
+            linestyle="--",
+            label="Time of Trigger",
+        )
+        ax1.axvline(
+            x=results[0][1]["reseed_time"],
+            color="red",
+            linestyle="--",
+            label="Time of Seed Change",
+        )
+        ax1.legend(loc="lower right")
 
         ax2.set_title("Queue size across trials")
         ax2.set_xlabel("time")
         ax2.set_ylabel("queue size")
-        for result in results:
+        for result, _ in results:
             ax2.plot(
                 result["queue_size"]["epoch"],
                 result["queue_size"]["size"],
