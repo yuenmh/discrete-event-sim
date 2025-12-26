@@ -3,7 +3,6 @@ import inspect
 import textwrap
 import types
 import warnings
-from collections import deque
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, field, replace
@@ -21,7 +20,6 @@ from typing import (
     Protocol,
     Self,
     Sequence,
-    assert_never,
     cast,
 )
 from uuid import UUID, uuid4
@@ -458,91 +456,12 @@ class _LeakDetector:
         return self.ema_diff > self.threshold
 
 
-class StateMarker:
-    uuid: UUID = field(default_factory=uuid4)
-
-
-class CloneContext:
-    def __init__(
-        self,
-        current_epoch_log: EffectLogRead[int],
-        self_addr_log: EffectLogRead[Addr],
-        self_node: Process,
-    ):
-        self.sent_messages: list[Event] = []
-        self.current_epoch_log = current_epoch_log
-        self.self_addr_log = self_addr_log
-        self.self_node = self_node
-
-    @property
-    def self_addr(self) -> Addr:
-        result = self.self_addr_log.pop()
-        if result is None:
-            raise RuntimeError("Inconsistent access pattern during cloning")
-        self.self_node._self_addr_log.append(result)
-        return result
-
-    def current_epoch(self) -> int:
-        result = self.current_epoch_log.pop()
-        if result is None:
-            raise RuntimeError("Inconsistent access pattern during cloning")
-        self.self_node._current_epoch_log.append(result)
-        return result
-
-    def append_log(self, log: LogEntry):
-        del log  # unused
-        pass
-
-
-class EffectLogWrite[T]:
-    def __init__(self):
-        self._entries: list[tuple[T, int]] = []
-
-    def append(self, entry: T, times: int = 1):
-        if times <= 0:
-            return
-        if self._entries and self._entries[-1][0] == entry:
-            last_entry, last_times = self._entries[-1]
-            self._entries[-1] = (last_entry, last_times + times)
-        self._entries.append((entry, times))
-
-    def to_reader(self) -> EffectLogRead[T]:
-        reader = EffectLogRead[T]()
-        reader._entries = deque(self._entries)
-        return reader
-
-
-class EffectLogRead[T]:
-    def __init__(self):
-        self._entries = deque[tuple[T, int]]()
-
-    def pop(self) -> T | None:
-        if not self._entries:
-            return None
-        entry, times = self._entries[0]
-        if times > 1:
-            self._entries[0] = (entry, times - 1)
-        else:
-            self._entries.popleft()
-        return entry
-
-
 class Process:
     def __init__(
         self,
         factory_or_sm: Callable[[], StateMachineInit] | StateMachineInit,
         seed: int | str | bytes,
     ):
-        if callable(factory_or_sm):
-            self._factory = factory_or_sm
-        elif hasattr(factory_or_sm, "clone_initial_state"):
-            self._factory = getattr(factory_or_sm, "clone_initial_state")
-        else:
-
-            def _error_factory():
-                raise TypeError("Provided StateMachineInit is not clonable")
-
-            self._factory = _error_factory
         if callable(factory_or_sm):
             init = factory_or_sm()
         else:
@@ -554,9 +473,6 @@ class Process:
         self._detector = _LeakDetector(alpha=0.09, threshold=0.1)
         self._init_seed = seed
         self._rng = Random(seed)
-        self._event_log: list[Message | Seed | StateMarker] = []
-        self._current_epoch_log = EffectLogWrite[int]()
-        self._self_addr_log = EffectLogWrite[Addr]()
         self._log: list[LogEntry] = []
 
     def run(
@@ -575,13 +491,10 @@ class Process:
             if result is not None:
                 i, next_sm = result
                 self._sm = next_sm
-                msg = self._inbox.pop(i)
-                self._event_log.append(msg)
+                _ = self._inbox.pop(i)
             else:
                 break
         self._analyze_inbox_growth(self_addr)
-        self._current_epoch_log.append(event_loop.epoch, times=ctx.num_now_calls)
-        self._self_addr_log.append(self_addr, times=ctx.num_self_calls)
         return ctx.sent_messages, ctx.logs
 
     def _analyze_inbox_growth(self, addr: Addr):
@@ -591,7 +504,6 @@ class Process:
             print(self._inbox, self._sm.matcher)
 
     def seed_rng(self, seed: int | str | bytes):
-        self._event_log.append(Seed(seed))
         self._rng.seed(seed)
 
     def deliver(self, msg: Message):
@@ -609,52 +521,6 @@ class Process:
                 self._inbox.pop(i)
                 return
         self._drop_hints.append(matcher)
-
-    def add_marker(self, marker: StateMarker | None = None) -> StateMarker:
-        if marker is None:
-            marker = StateMarker()
-        self._event_log.append(marker)
-        return marker
-
-    def clone(self, marker: StateMarker | None = None) -> Process:
-        new_process = Process(self._factory, seed=self._init_seed)
-        new_process._inbox.clear()
-        if marker is None:
-            events = self._event_log
-        else:
-            try:
-                index = self._event_log.index(marker) + 1
-            except ValueError:
-                raise ValueError("Marker not found in event log") from None
-            events = self._event_log[:index]
-        for event in events:
-            match event:
-                case Seed(data):
-                    new_process.seed_rng(data)
-                case Message():
-                    if next := next_state(
-                        new_process._sm,
-                        ctx=CloneContext(
-                            current_epoch_log=self._current_epoch_log.to_reader(),
-                            self_addr_log=self._self_addr_log.to_reader(),
-                            self_node=new_process,
-                        ),
-                        msgs=[event],
-                    ):
-                        _, next_sm = next
-                        new_process._sm = next_sm
-                    else:
-                        raise RuntimeError(
-                            "Inconsistent state during cloning: message could not be delivered"
-                        )
-
-                case StateMarker():
-                    if event == marker:
-                        break
-                case _:
-                    assert_never(event)
-        new_process._event_log = events.copy()
-        return new_process
 
 
 @dataclass(frozen=True, slots=True)
@@ -800,14 +666,6 @@ class EventLoop:
                 break
 
         return RunResult(logs=self.logs, num_epochs=last_epoch)
-
-    def clone(self) -> EventLoop:
-        new_loop = EventLoop(seed=self.seed)
-        new_loop.epoch = self.epoch
-        new_loop.logs = self.logs.copy()
-        new_loop.event_queue = self.event_queue.copy()
-        new_loop.nodes = {addr: node.clone() for addr, node in self.nodes.items()}
-        return new_loop
 
     def find(self, addr: Addr | str) -> Process:
         if isinstance(addr, str):

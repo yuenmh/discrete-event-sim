@@ -1,3 +1,4 @@
+import concurrent.futures
 from typing import TYPE_CHECKING, Any
 
 import matplotlib.pyplot as plt
@@ -152,7 +153,8 @@ def experiment2(
     retry_delay: int = 100,
     inter_sleep: int = 4000,
     trigger_delay: int = 1_000_000,
-    seed: int = 0,
+    shared_seed: int = 0,
+    local_seed: int = 100,
 ):
     this = self
 
@@ -245,7 +247,7 @@ def experiment2(
 
         return trigger
 
-    el = EventLoop(seed=seed)
+    el = EventLoop(seed=shared_seed)
     el.spawn(queue_addr, lambda: Queue.create(max_size=20))
     el.spawn(Addr("worker"), create_worker)
     el.spawn(Addr("client"), create_client)
@@ -254,16 +256,14 @@ def experiment2(
     reseed_time = trigger_delay + 100_000
     el.run(reseed_time)
 
-    for seed in range(10):
-        new_el = el.clone()
-        new_el.seed_all(seed)
-        yield (
-            analyze_data(new_el.run(6_000_000)),
-            {
-                "reseed_time": reseed_time // 1000,
-                "trigger_time": trigger_delay // 1000,
-            },
-        )
+    el.seed_all(local_seed)
+    return (
+        analyze_data(el.run(20_000_000)),
+        {
+            "reseed_time": reseed_time // 1000,
+            "trigger_time": trigger_delay // 1000,
+        },
+    )
 
 
 def plot_single_run_metrics(metrics: dict[str, pl.DataFrame]):
@@ -318,7 +318,18 @@ def plot_single_run_metrics(metrics: dict[str, pl.DataFrame]):
 
 
 def metastable_comparison_plot():
-    results = list(tqdm(experiment2(timeout=1910, seed=0), total=10))
+    num_trials = 10
+    with concurrent.futures.ProcessPoolExecutor() as executor:
+        futures = [
+            executor.submit(
+                experiment2, timeout=1910, shared_seed=0, local_seed=local_seed
+            )
+            for local_seed in range(num_trials)
+        ]
+        results = [
+            fut.result()
+            for fut in tqdm(concurrent.futures.as_completed(futures), total=num_trials)
+        ]
 
     def plot_metrics(
         ax1: Axes,
