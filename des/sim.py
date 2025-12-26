@@ -1,3 +1,4 @@
+import hashlib
 import heapq
 import inspect
 import textwrap
@@ -625,7 +626,12 @@ class EventLoop:
         addr: Addr,
         init: Callable[[], StateMachineInit] | StateMachineInit,
     ):
-        node = Process(init, seed=f"{addr.name}{self.seed}")
+        node = Process(
+            init,
+            # Dumb seeding method for backward compatibility
+            # TODO: Should be removed later
+            seed=hashlib.sha256(f"{addr.name}{self.seed}".encode()).digest(),
+        )
         self.nodes[addr] = node
         return node
 
