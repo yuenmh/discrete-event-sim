@@ -138,8 +138,29 @@ def analyze_data(result: RunResult):
         smooth_series(retries.get_column("retries"), avg_window=avg_window)
     )
 
+    compute_time = (
+        pl.DataFrame(
+            [
+                (
+                    entry.epoch // 1000,
+                    entry.data["compute_time"],
+                )
+                for entry in result.logs
+                if entry.msg == "work_completed"
+            ],
+            schema=["epoch", "compute_time"],
+            orient="row",
+        )
+        .group_by("epoch", maintain_order=True)
+        .agg(pl.col("compute_time").mean())
+    )
+    compute_time = compute_time.with_columns(
+        smooth_series(compute_time.get_column("compute_time"), avg_window=avg_window)
+    )
+
     return {
         "goodput": goodput,
+        "compute_time": compute_time,
         "queue_size": queue_size,
         "sends": sends,
         "retries": retries,
@@ -184,11 +205,13 @@ def experiment2(
         async def worker_process():
             while True:
                 addr, ref = await queue.dequeue()
-                await sleep(
+                compute_time = (
                     work_time
                     - work_time_rand
                     + int(rng().expovariate(1 / work_time_rand))
                 )
+                await sleep(compute_time)
+                log("work_completed", ref=ref, compute_time=compute_time)
                 send(addr, ref, hint="done")
 
         return worker_process
@@ -260,6 +283,7 @@ def experiment2(
     return (
         analyze_data(el.run(20_000_000)),
         {
+            "local_seed": local_seed,
             "reseed_time": reseed_time // 1000,
             "trigger_time": trigger_delay // 1000,
         },
@@ -330,10 +354,12 @@ def metastable_comparison_plot():
             fut.result()
             for fut in tqdm(concurrent.futures.as_completed(futures), total=num_trials)
         ]
+    results.sort(key=lambda x: x[1]["local_seed"])
 
     def plot_metrics(
         ax1: Axes,
         ax2: Axes,
+        ax3: Axes,
         results: list[tuple[dict[str, pl.DataFrame], dict[str, Any]]],
     ):
         ax1.set_title("Number of completed tasks across trials")
@@ -371,10 +397,22 @@ def metastable_comparison_plot():
                 linewidth=1,
             )
 
-    fig = plt.figure(figsize=(16, 5))
+        ax3.set_title("Compute time")
+        ax3.set_xlabel("time")
+        ax3.set_ylabel("compute time")
+        for result, _ in results:
+            ax3.plot(
+                result["compute_time"]["epoch"],
+                result["compute_time"]["compute_time"],
+                alpha=0.5,
+                linewidth=1,
+            )
+
+    fig = plt.figure(figsize=(16, 10))
     plot_metrics(
-        fig.add_subplot(1, 2, 1),
-        fig.add_subplot(1, 2, 2),
+        fig.add_subplot(2, 2, 1),
+        fig.add_subplot(2, 2, 2),
+        fig.add_subplot(2, 2, 3),
         results,
     )
     fig.tight_layout()
