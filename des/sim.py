@@ -892,9 +892,16 @@ class _StateMachineBaseMeta(type):
 
         attrs["__branches__"] = branches
 
+        methods = {fn.__name__: match_args for match_args, fn in branches}
+
         attrs["__interface_cls__"] = _make_interface_class(
             name=f"{name}Proxy",
-            methods={fn.__name__: match_args for match_args, fn in branches},
+            methods=methods,
+            helper_methods={
+                name: value
+                for name, value in attrs.items()
+                if name not in methods and name not in ("__init__",)
+            },
         )
         return super().__new__(cls, name, bases, attrs)
 
@@ -904,7 +911,9 @@ class StubAwaitable:
         return None
 
 
-def _make_interface_class(name: str, methods: dict[str, tuple[Any, ...]]):
+def _make_interface_class(
+    name: str, methods: dict[str, tuple[Any, ...]], helper_methods: dict[str, Callable]
+):
     namespace = {}
 
     init_code = textwrap.dedent("""
@@ -926,6 +935,8 @@ def _make_interface_class(name: str, methods: dict[str, tuple[Any, ...]]):
         exec(method_code, globals(), locals)
         namespace[method_name] = locals[method_name]
         namespace[f"__{method_name}_args__"] = start_args
+
+    namespace.update(helper_methods)
 
     return type(name, (object,), namespace)
 
@@ -955,5 +966,12 @@ def handle(*match_args: Any):
     return decorator
 
 
-def interface[T: StateMachineBase](ty: type[T], addr: Addr):
+def interface[T: StateMachineBase](ty: type[T], addr: Addr) -> T:
     return getattr(ty, "__interface_cls__")(addr)
+
+
+def addr_of(wrapper: Any) -> Addr:
+    if hasattr(wrapper, "__addr__"):
+        return wrapper.__addr__
+    else:
+        raise TypeError("'addr_of' only works in proxy helper methods")

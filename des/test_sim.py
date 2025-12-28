@@ -7,6 +7,7 @@ from .sim import (
     Ref,
     SMBuilder,
     StateMachineBase,
+    addr_of,
     ask,
     ask_timeout,
     handle,
@@ -134,8 +135,11 @@ def test_class_based_counter():
             self.counter += 1
 
         @handle()
-        async def get(self, sender: Addr, ref: Ref):
+        async def _get(self, sender: Addr, ref: Ref):
             send(sender, ref, self.counter)
+
+        async def get(self) -> int:
+            return await ask(addr_of(self), Counter._get)
 
     counter_addr = Addr("counter")
     counter = interface(Counter, counter_addr)
@@ -150,11 +154,9 @@ def test_class_based_counter():
 
             await sleep_until(100_000)
 
-            value = await ask(counter_addr, Counter.get)
+            value = await counter.get()
             assert value == 20
             log("done")
-
-    print()
 
     event_loop = EventLoop()
     event_loop.spawn(counter_addr, Counter())
