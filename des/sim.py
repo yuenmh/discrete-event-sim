@@ -702,6 +702,10 @@ def self() -> Addr:
     return context().self_addr
 
 
+def this() -> Addr:
+    return self()
+
+
 def _self_node() -> Process:
     return context().self_node
 
