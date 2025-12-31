@@ -8,6 +8,7 @@ from .sim import (
     SMBuilder,
     StateMachineBase,
     StateMachineInit,
+    addr_of,
     ask,
     handle,
     log,
@@ -87,3 +88,36 @@ class LaunchedStateMachine(StateMachineBase):
     async def start(self):
         """Override to implement the launched state machine's behavior."""
         raise NotImplementedError
+
+
+class WaitGroup(StateMachineBase):
+    def __init__(self, count: int = 0):
+        self._count = count
+        self._waiters: list[tuple[Addr, Ref]] = []
+
+    @handle()
+    async def _change(self, delta: int):
+        new_count = self._count + delta
+        if new_count <= 0:
+            self._count = 0
+            for addr, ref in self._waiters:
+                send(addr, ref, Ok)
+            self._waiters.clear()
+        else:
+            self._count = new_count
+
+    def add(self, delta: int = 1):
+        send(addr_of(self), WaitGroup._change, delta)
+
+    def done(self):
+        self.add(-1)
+
+    @handle()
+    async def _wait(self, sender: Addr, ref: Ref):
+        if self._count == 0:
+            send(sender, ref, Ok)
+        else:
+            self._waiters.append((sender, ref))
+
+    async def wait(self):
+        await ask(addr_of(self), WaitGroup._wait)

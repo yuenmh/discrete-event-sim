@@ -806,6 +806,11 @@ def spawn(target: _Spawnable, name: str = "child") -> Addr:
     return addr
 
 
+def spawn_interface[T: StateMachineBase](target: T, name: str = "child") -> T:
+    addr = spawn(target, name=name)
+    return interface(type(target), addr)
+
+
 class _FusedRefSelect:
     def __init__(self, refs: tuple[Ref, ...]):
         self.refs = refs
@@ -959,11 +964,6 @@ class _StateMachineBaseMeta(type):
         return super().__new__(cls, name, bases, attrs)
 
 
-class StubAwaitable:
-    def __await__(self):
-        return None
-
-
 def _make_interface_class(
     name: str, methods: dict[str, tuple[Any, ...]], helper_methods: dict[str, Callable]
 ):
@@ -982,7 +982,6 @@ def _make_interface_class(
         method_code = textwrap.dedent(f"""
             def {method_name}(self, *args, **kwargs):
                 self.__send__(self.__addr__, *self.__{method_name}_args__, *args, **kwargs)
-                return StubAwaitable()
         """)
         locals = {}
         exec(method_code, globals(), locals)

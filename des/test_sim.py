@@ -1,3 +1,4 @@
+import warnings
 from dataclasses import dataclass
 
 from .sim import (
@@ -15,13 +16,15 @@ from .sim import (
     launch,
     log,
     loop,
+    rng,
     send,
     sleep,
     sleep_until,
     spawn,
+    spawn_interface,
     stop,
 )
-from .stdlib import LaunchedStateMachine, Queue
+from .stdlib import LaunchedStateMachine, Queue, WaitGroup
 
 
 def test_simple():
@@ -120,7 +123,9 @@ def test_timeout():
     event_loop = EventLoop()
     event_loop.spawn(Addr("do_nothing"), do_nothing)
     event_loop.spawn(Addr("main"), main)
-    event_loop.run(epochs=50)
+    with warnings.catch_warnings():
+        warnings.filterwarnings("ignore")
+        event_loop.run(epochs=50)
 
     assert any(
         log.msg == "timed out" for log in event_loop.logs if log.addr.name == "main"
@@ -216,3 +221,32 @@ def test_spawn_tasks():
 
     assert len(logs) == 10
     assert all(log.msg == "foo" and log.epoch == 20 for log in logs)
+
+
+def test_spawn_and_join():
+    class Worker(LaunchedStateMachine):
+        def __init__(self, wg: WaitGroup):
+            self.wg = wg
+
+        async def start(self):
+            await sleep(rng().randint(10, 20))
+            self.wg.done()
+            log("done")
+
+    @launch
+    async def main():
+        wg = spawn_interface(WaitGroup())
+        for _ in range(10):
+            wg.add()
+            spawn(Worker(wg))
+        await wg.wait()
+        log("all done")
+
+    event_loop = EventLoop()
+    event_loop.spawn(Addr("main"), main)
+    logs = event_loop.run(epochs=100).logs
+
+    assert any(log.msg == "all done" for log in logs)
+    all_done_ts = next(log.epoch for log in logs if log.msg == "all done")
+    max_done_ts = max(log.epoch for log in logs if log.msg == "done")
+    assert all_done_ts >= max_done_ts
