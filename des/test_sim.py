@@ -18,6 +18,8 @@ from .sim import (
     send,
     sleep,
     sleep_until,
+    spawn,
+    stop,
 )
 from .stdlib import LaunchedStateMachine, Queue
 
@@ -162,3 +164,55 @@ def test_class_based_counter():
     event_loop.spawn(counter_addr, Counter())
     event_loop.spawn(Addr("main"), Main())
     assert any(log.msg == "done" for log in event_loop.run(epochs=1_000_000).logs)
+
+
+def test_stop_no_await():
+    @launch
+    async def main():
+        i = 0
+        while True:
+            log(i=i)
+            i += 1
+            stop()
+
+    event_loop = EventLoop()
+    event_loop.spawn(Addr("main"), main)
+    logs = event_loop.run(epochs=100).logs
+    assert len(logs) == 1
+    assert logs[0].data["i"] == 0
+
+
+def test_stop_after_await():
+    @launch
+    async def main():
+        i = 0
+        while True:
+            await sleep(1)
+            log(i=i)
+            i += 1
+            stop()
+
+    event_loop = EventLoop()
+    event_loop.spawn(Addr("main"), main)
+    logs = event_loop.run(epochs=100).logs
+    assert len(logs) == 1
+    assert logs[0].data["i"] == 0
+
+
+def test_spawn_tasks():
+    class BackgroundTask(LaunchedStateMachine):
+        async def start(self):
+            await sleep_until(20)
+            log("foo")
+
+    @launch
+    async def main():
+        for _ in range(10):
+            spawn(BackgroundTask())
+
+    event_loop = EventLoop()
+    event_loop.spawn(Addr("main"), main)
+    logs = event_loop.run(epochs=100).logs
+
+    assert len(logs) == 10
+    assert all(log.msg == "foo" and log.epoch == 20 for log in logs)

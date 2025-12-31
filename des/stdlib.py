@@ -13,6 +13,7 @@ from .sim import (
     log,
     message,
     send,
+    stop,
 )
 
 __all__ = ["Ok", "Err", "Queue"]
@@ -81,6 +82,7 @@ class LaunchedStateMachine(StateMachineBase):
     @handle(Start)
     async def _start(self):
         await self.start()
+        stop()
 
     async def start(self):
         """Override to implement the launched state machine's behavior."""

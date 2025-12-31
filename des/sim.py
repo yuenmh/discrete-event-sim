@@ -17,6 +17,7 @@ from typing import (
     Generator,
     Iterable,
     Mapping,
+    Never,
     ParamSpec,
     Protocol,
     Self,
@@ -215,6 +216,9 @@ class Context(Protocol):
     def self_node(self) -> Process: ...
     def current_epoch(self) -> int: ...
     def append_log(self, log: LogEntry): ...
+    def spawn(self, addr: Addr, init: _Spawnable): ...
+    @property
+    def state(self) -> types.SimpleNamespace: ...
 
 
 class StateMachine(Protocol):
@@ -416,6 +420,9 @@ def async_transition(continuation: StateMachine):
     return decorator
 
 
+type _Spawnable = Callable[[], StateMachineInit] | StateMachineInit
+
+
 @dataclass
 class ContextImpl:
     _current_epoch: int
@@ -423,6 +430,8 @@ class ContextImpl:
     sent_messages: list[Event]
     self_node: Process
     logs: list[LogEntry] = field(default_factory=list)
+    spawned: dict[Addr, _Spawnable] = field(default_factory=dict)
+    state: types.SimpleNamespace = field(default_factory=types.SimpleNamespace)
 
     num_now_calls: int = 0
     num_self_calls: int = 0
@@ -438,6 +447,9 @@ class ContextImpl:
 
     def append_log(self, log: LogEntry):
         self.logs.append(log)
+
+    def spawn(self, addr: Addr, init: _Spawnable):
+        self.spawned[addr] = init
 
 
 class _LeakDetector:
@@ -457,10 +469,18 @@ class _LeakDetector:
         return self.ema_diff > self.threshold
 
 
+@dataclass
+class ProcessRunResult:
+    sent_messages: list[Event] = field(default_factory=list)
+    logs: list[LogEntry] = field(default_factory=list)
+    spawned: dict[Addr, _Spawnable] = field(default_factory=dict)
+    stopped: bool = False
+
+
 class Process:
     def __init__(
         self,
-        factory_or_sm: Callable[[], StateMachineInit] | StateMachineInit,
+        factory_or_sm: _Spawnable,
         seed: int | str | bytes,
     ):
         if callable(factory_or_sm):
@@ -475,20 +495,24 @@ class Process:
         self._init_seed = seed
         self._rng = Random(seed)
         self._log: list[LogEntry] = []
+        self._local_state = types.SimpleNamespace()
 
-    def run(
-        self, self_addr: Addr, event_loop: EventLoop
-    ) -> tuple[list[Event], list[LogEntry]]:
+    def run(self, self_addr: Addr, event_loop: EventLoop) -> ProcessRunResult:
         if self._stopped:
-            return [], []
+            return ProcessRunResult(stopped=True)
         ctx = ContextImpl(
             _current_epoch=event_loop.epoch,
             _self_addr=self_addr,
             sent_messages=[],
             self_node=self,
+            state=self._local_state,
         )
         while True:
-            result = next_state(self._sm, ctx=ctx, msgs=self._inbox)
+            try:
+                result = next_state(self._sm, ctx=ctx, msgs=self._inbox)
+            except StopStateMachine:
+                self._stopped = True
+                break
             if result is not None:
                 i, next_sm = result
                 self._sm = next_sm
@@ -496,7 +520,12 @@ class Process:
             else:
                 break
         self._analyze_inbox_growth(self_addr)
-        return ctx.sent_messages, ctx.logs
+        return ProcessRunResult(
+            sent_messages=ctx.sent_messages,
+            logs=ctx.logs,
+            spawned=ctx.spawned,
+            stopped=self._stopped,
+        )
 
     def _analyze_inbox_growth(self, addr: Addr):
         self._detector.update(len(self._inbox))
@@ -602,15 +631,10 @@ class PriorityQueue[T]:
 
 
 @dataclass
-class Seed:
-    data: int | str | bytes
-
-
-@dataclass
 class Event:
     recipient: Addr
     delivery_epoch: int
-    payload: Message | Seed
+    payload: Message
 
 
 class EventLoop:
@@ -624,7 +648,7 @@ class EventLoop:
     def spawn(
         self,
         addr: Addr,
-        init: Callable[[], StateMachineInit] | StateMachineInit,
+        init: _Spawnable,
     ):
         node = Process(
             init,
@@ -651,23 +675,36 @@ class EventLoop:
                 except KeyError:
                     raise RuntimeError(f"Send to unknown address: {event}")
                 match event.payload:
-                    case Seed(data):
-                        node.seed_rng(data)
                     case Message():
                         node.deliver(event.payload)
 
+            spawned = dict[Addr, _Spawnable]()
+
+            finished = set[Addr]()
+
             for addr, node in self.nodes.items():
-                sent_msgs, new_logs = node.run(
+                proc_result = node.run(
                     self_addr=addr,
                     event_loop=self,
                 )
-                self.event_queue.extend(sent_msgs)
-                self.logs.extend(new_logs)
+                self.event_queue.extend(proc_result.sent_messages)
+                self.logs.extend(proc_result.logs)
+                spawned.update(proc_result.spawned)
+                if proc_result.stopped:
+                    finished.add(addr)
+
+            for addr, init in spawned.items():
+                self.spawn(addr, init)
+
+            for addr in finished:
+                del self.nodes[addr]
 
             last_epoch = self.epoch
 
             if next_event := self.event_queue.peek():
                 self.epoch = max(self.epoch + 1, next_event.delivery_epoch)
+            elif spawned:  # all processes could have finished before spawned processes have a chance to run
+                self.epoch += 1
             else:
                 break
 
@@ -753,8 +790,20 @@ async def ask(addr: Addr, method: Any, *args: Any, **kwargs: Any) -> Any:
     return result
 
 
-def stop():
-    _self_node()._stopped = True
+def stop() -> Never:
+    raise StopStateMachine()
+
+
+def spawn(target: _Spawnable, name: str = "child") -> Addr:
+    try:
+        index = context().state.child_index
+        context().state.child_index += 1
+    except AttributeError:
+        index = 0
+        context().state.child_index = 1
+    addr = Addr(f"{this().name}/{name}{index}")
+    context().spawn(addr, target)
+    return addr
 
 
 class _FusedRefSelect:
