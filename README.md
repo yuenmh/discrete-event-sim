@@ -1,15 +1,40 @@
 # Prototype discrete event sim
 
-Dependencies are in the `pyproject.toml`, you can install normally or with uv.
+## Installation
 
-## Class based state machine
+The dependencies are in `pyproject.toml`, so it can be installed with `pip install -e .` or with `uv`. I would say `uv` is much easier
+because it automatically creates the venv and makes it very easy to download python versions.
 
-After adding the ability to clone the entire state, I realized there needs to be a better way to group state and behavior
-than just storing it in stack frames.
+Linters are specified in the makefile.
 
-The stuff in Old Examples still works, but I think this is better.
+## Basic concepts
 
-An example of a counter:
+The core primitives are processes that communicate by sending messages to each other.
+Messages are basically tuples of arbitrary objects, and state machines expose patterns that specify what shape of messages they
+can handle in their current state. Each process has an inbox where
+messages are stored until its associated state machine is able to handle them. Processes can also spawn other state machines
+to create new processes.
+
+The main entrypoint of the library is the `EventLoop` class, which implements the message passing and process scheduling.
+The workflow for running simulations is to define the state machines, add the root processes to the event loop to be spawned
+at startup, then run the event loop.
+
+### Important types
+
+- `Addr`: address of a process. This is what is passed into `send` and similar functions to identify the target process.
+- `Ref`: unique reference for matching responses to requests.
+
+The canonical call with no response pattern is to send a message of the form `(method, *args)` to the target address.
+If the result is needed, then the pattern is `(method, sender_addr, ref, *args)`. Then the receiver can send the result
+back to `sender_addr` with the pattern `(ref, result)`.
+
+## Defining state machines
+
+To define a state machine, subclass `StateMachineBase`. Methods decorated with `@handle()` become message handlers that are
+called by sending messages to the process address. This base class creates two things: the state machine implementation;
+and a proxy object that hides the low-level `send` calls.
+
+The following is an example of a simple counter state machine:
 
 ```python
 class Counter(StateMachineBase):
@@ -21,115 +46,63 @@ class Counter(StateMachineBase):
         self.counter += 1
 
     @handle()
-    async def get(self, sender: Addr, ref: Ref):
+    async def _get(self, sender: Addr, ref: Ref):
         send(sender, ref, self.counter)
+
+    async def get(self) -> int:
+        """wrapper around get for the proxy object"""
+        return await ask(addr_of(self), Counter._get)
 ```
 
-Then it can be used as follows:
+Each async function decorated with `handle` implements how to handle a specific message. If `handle` is called with no arguments as shown,
+the state machine reacts to messages that start with the decorated function object. Otherwise, the arguments specify the pattern to match.
+These functions become non-async methods on the proxy object that send messages to the process address.
+
+Methods not decorated with `handle` are just normal functions and are present in both the state machine and the proxy object. This means
+that you must decide whether a method is intended to be used by a message handler (in the process) or as part of the proxy object (by other processes).
+
+The normal constructor creates the state machine implementation. To create the proxy object, use `interface` to wrap an existing address, or
+`spawn_interface` to spawn a new process and wrap its address with a proxy.
+
+From the implementation of another state machine, the counter can be spawned and used as follows:
 
 ```python
-counter = interface(Counter, counter_addr)
+counter = spawn_interface(Counter())
 counter.inc()
-value = await ask(counter_addr, Counter.get)
+value = await counter.get()
 ```
 
-`interface` creates a proxy object that sends messages to the process address. I still need to figure out an analogue for `ask`.
-An important design constraint is that this has to work with the old way because implemening queues/locks requires decoupled
-send and wait.
+> [!NOTE]
+> I am planning to add a way of automatically creating a "getter" type method like `get` in the above example. The challenge is finding something
+> that still allows type checking.
 
-## Old Examples
+To define a state machine that acts more like a main function, or as a client as opposed to a server, subclass `LaunchedStateMachine` and override `start`,
+or use the `@launch` decorator on an async function. This decorator turns the function into a state machine.
 
-Most of the stuff for creating protocols comes from `des.sim`.
-For creating a process that is like a server, use `SMBuilder` which is similar to the FastAPI builder
-in that it has a decorator you place on a function to handle messages sent to the process.
-
-For example, a simple process that accepts a ping message can be created like this:
-
-```python
-from des.sim import SMBuilder, Atom, Addr, Ref, send
-
-class Ping(Atom): ...
-
-ping_server = SMBuilder()
-
-@ping_server.handle(Ping)
-async def handle_ping(sender: Addr, ref: Ref):
-    send(sender, ref, "pong")
-```
-
-You can basically think of each thing annotated with `handle` as being like an endpoint.
-
-> **Note**: The `Atom` base class just implements equality on the class itself with instances of the class so you can send the class
-> and use the `match` statement to handle it.
->
-> `Addr` represents a process address, and `Ref` is a unique reference for an action. The ref thing is a common pattern from
-> erlang where you send a message with a ref and the receiver responds with the same ref so you can match responses to requests.
->
-> Items in the `handle` decorator are matched against the beginning of the message and stripped off before the rest of the message
-> params are passed to the handler function. So in the above example, when that process receives a message like `(Ping, Addr(...), Ref(...))`,
-> the `Ping` item is matched and stripped off, and the remaining items `Addr(...)` and `Ref(...)` are passed as parameters to the handler.
-
-For simple cases when you just want to spawn a process that acts more like a client than a server, you can use the `launch` decorator.
-This preloads the inbox with a message to start the process when you spawn it.
-
-```python
-# imports ...
-ping_server_addr = ...
-
-@launch
-async def client():
-    # demo of sending a ping and waiting for a response
-    ref = Ref()
-    send(ping_server_addr, Ping, self(), ref)
-    msg = await wait(ref)
-
-    # this is a common pattern, so there is also ask
-    msg = await ask(ping_server_addr, Ping)
-```
-
-You can loop inside but there should probably be at least one `await` so it doesn't run forever.
-
-To run the simulation use the `EventLoop` class and spawn each process with `EventLoop.spawn(addr, sm)`,
-where `sm` is the thing returned by `SMBuilder` and what `launch` turns the function into.
-Then run with `EventLoop.run(num_epochs)` (you can decide like 1 epoch = 1ms).
-
-```python
-el = EventLoop(seed=1)
-el.spawn(Addr("ping_server"), ping_server)
-el.spawn(Addr("client1"), client)
-el.run(100_000)
-```
-
-## Working api for now
+## API for implementing state machines
 
 Functions for sending and waiting are as follows:
 
 - `send(addr, *msg)`: send a message to the given address
-- `await ask(addr, method, *args)`: constructs a message like `(method, self(), Ref(), *args)` and sends it to the address, then
+- `await ask(addr, method, *args)`: constructs a message like `(method, this(), Ref(), *args)` and sends it to the address, then
   waits for a response with the same ref, and returns the first item of the response message after the ref.
 - `await wait(*msg)`: waits for a message matching the given items and returns the rest of the message items.
 - `await {ask,wait}_timeout(timeout, ...)`: same as above but raises `TimeoutError` if the timeout is reached.
+- `spawn(state_machine)`, `spawn_interface(state_machine)`: spawn a new process running the given state machine.
+  The former returns the new address, the latter returns a proxy object.
 
 These functions get the state from a contextvar that the event loop manages. Others are:
 
-- `self()`: probably a mistake naming it self and should be renamed to `this`. Gets the current process address.
+- `this()`: Gets the current process address.
 - `rng()`, `now()`, `stop()`, `sleep()`, `sleep_until()`: self explanatory
 - `log(msg, **kwargs)` is currently the main way of calculating statistics. The pattern I have been using is to pick
-  a unique name for each type of event and then filter the log after and put the values into a dataframe to analyze.
+  a unique name for each type of event and then filter the log after running the sim and put the values into a dataframe to analyze.
 
-I would consider the others to be internal.
+## Premade state machines
 
-There is a premade queue in `des.stdlib`. The `Queue` class is a wrapper around the address that sends and waits in the right way.
+There are premade fundamental state machines in `des.stdlib`.
 
-## Problems
+- `Queue`: FIFO queue. I need to rewrite it to use the new class-based state machine system.
+- `WaitGroup`: similar to `sync.WaitGroup` in go. The purpose is to join multiple child processes.
 
-~Big problem: there is no way of saving the state and resuming it later. This is because the state of all processes is stored
-in the call stack of coroutines, which as far as I know cannot be cloned or serialized. I am not entirely sure how to fix this.~
-Fixed now!
-
-No way to spawn from inside a process. This might be good depending on how you look at it. A workaround is just spawn everything
-that is needed, and wake up at the predetermined time.
-
-~I want to figure out a way to make the at least the send typesafe. Current ideas are to require properties with type annotations
-on the `Atom` subclasses, then check at runtime that all the required args are there; or maybe something can be done with `typing.ParamSpec`.~
-Introduced class based state machines instead.
+`LaunchedStateMachine` is a base class for a state machine that runs immediately on spawn.
