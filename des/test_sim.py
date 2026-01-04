@@ -24,7 +24,7 @@ from .sim import (
     spawn_interface,
     stop,
 )
-from .stdlib import LaunchedStateMachine, Queue, WaitGroup
+from .stdlib import LaunchedStateMachine, Queue, Semaphore, WaitGroup
 
 
 def test_simple():
@@ -250,3 +250,44 @@ def test_spawn_and_join():
     all_done_ts = next(log.epoch for log in logs if log.msg == "all done")
     max_done_ts = max(log.epoch for log in logs if log.msg == "done")
     assert all_done_ts >= max_done_ts
+
+
+def test_semaphore():
+    class Task(LaunchedStateMachine):
+        def __init__(self, sem: Semaphore, wg: WaitGroup):
+            self.sem = sem
+            self.wg = wg
+
+        async def start(self):
+            await self.sem.acquire()
+            log("acquired")
+            await sleep(rng().randint(10, 20))
+            self.sem.release()
+            log("released")
+            self.wg.done()
+
+    @launch
+    async def main():
+        sem = spawn_interface(Semaphore(max_count=3))
+        wg = spawn_interface(WaitGroup())
+        for _ in range(100):
+            wg.add()
+            spawn(Task(sem, wg))
+        await wg.wait()
+        log("done")
+
+    event_loop = EventLoop()
+    event_loop.spawn(Addr("main"), main)
+    logs = event_loop.run(epochs=10000).logs
+
+    assert any(log.msg == "done" for log in logs)
+
+    # at most 3 "acquired" logs should be active at any time
+    current_holders = 0
+    for log_entry in logs:
+        if log_entry.msg == "acquired":
+            current_holders += 1
+            assert current_holders <= 3
+        elif log_entry.msg == "released":
+            current_holders -= 1
+    assert current_holders == 0

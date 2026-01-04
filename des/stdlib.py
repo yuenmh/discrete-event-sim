@@ -1,3 +1,4 @@
+from collections import deque
 from dataclasses import dataclass
 from typing import Any
 
@@ -15,6 +16,9 @@ from .sim import (
     message,
     send,
     stop,
+    this,
+    wait,
+    wait_timeout,
 )
 
 __all__ = ["Ok", "Err", "Queue"]
@@ -121,3 +125,34 @@ class WaitGroup(StateMachineBase):
 
     async def wait(self):
         await ask(addr_of(self), WaitGroup._wait)
+
+
+# TODO: fix issue with context manager not having access to the event loop contextvar
+class Semaphore(StateMachineBase):
+    def __init__(self, max_count: int):
+        self.max_count = max_count
+        self.current_count = 0
+        self.waiting: deque[tuple[Addr, Ref]] = deque()
+
+    @handle()
+    async def _acquire(self, requester: Addr, ref: Ref):
+        if self.current_count < self.max_count:
+            self.current_count += 1
+            send(requester, ref, hint="semaphore granted instantly")
+        else:
+            self.waiting.append((requester, ref))
+
+    async def acquire(self, timeout: int | None = None):
+        self._acquire(this(), ref := Ref())
+        if timeout is not None:
+            await wait_timeout(timeout, ref)
+        else:
+            await wait(ref)
+
+    @handle()
+    async def release(self):
+        if self.waiting:
+            requester, ref = self.waiting.popleft()
+            send(requester, ref, hint="semaphore granted after wait")
+        else:
+            self.current_count -= 1
