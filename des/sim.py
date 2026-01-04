@@ -471,6 +471,7 @@ class _LeakDetector:
 
 @dataclass
 class ProcessRunResult:
+    num_iters: int = 0
     sent_messages: list[Event] = field(default_factory=list)
     logs: list[LogEntry] = field(default_factory=list)
     spawned: dict[Addr, _Spawnable] = field(default_factory=dict)
@@ -480,15 +481,11 @@ class ProcessRunResult:
 class Process:
     def __init__(
         self,
-        factory_or_sm: _Spawnable,
+        init: StateMachineInit,
         seed: int | str | bytes,
     ):
-        if callable(factory_or_sm):
-            init = factory_or_sm()
-        else:
-            init = factory_or_sm
         self._sm = init.sm
-        self._inbox: list[Message] = [*init.messages]
+        self._inbox: list[Message] = []
         self._drop_hints: list[Matcher] = []
         self._stopped = False
         self._detector = _LeakDetector(alpha=0.09, threshold=0.1)
@@ -507,6 +504,7 @@ class Process:
             self_node=self,
             state=self._local_state,
         )
+        num_iters = 0
         while True:
             try:
                 result = next_state(self._sm, ctx=ctx, msgs=self._inbox)
@@ -517,10 +515,12 @@ class Process:
                 i, next_sm = result
                 self._sm = next_sm
                 _ = self._inbox.pop(i)
+                num_iters += 1
             else:
                 break
         self._analyze_inbox_growth(self_addr)
         return ProcessRunResult(
+            num_iters=num_iters,
             sent_messages=ctx.sent_messages,
             logs=ctx.logs,
             spawned=ctx.spawned,
@@ -640,6 +640,7 @@ class Event:
 class EventLoop:
     def __init__(self, seed: int | str | None = None):
         self.nodes = dict[Addr, Process]()
+        self._exited_nodes = set[Addr]()
         self.logs: list[LogEntry] = []
         self.epoch = 0
         self.event_queue = PriorityQueue[Event](key=lambda event: event.delivery_epoch)
@@ -648,13 +649,20 @@ class EventLoop:
     def spawn(
         self,
         addr: Addr,
-        init: _Spawnable,
+        spawnable: _Spawnable,
     ):
+        if callable(spawnable):
+            init = spawnable()
+        else:
+            init = spawnable
         node = Process(
             init,
             # Dumb seeding method for backward compatibility
             # TODO: Should be removed later
             seed=hashlib.sha256(f"{addr.name}{self.seed}".encode()).digest(),
+        )
+        self.event_queue.extend(
+            Event(recipient=addr, delivery_epoch=0, payload=m) for m in init.messages
         )
         self.nodes[addr] = node
         return node
@@ -673,6 +681,10 @@ class EventLoop:
                 try:
                     node = self.nodes[event.recipient]
                 except KeyError:
+                    # allow delivery to exited nodes. this still distinguishes between sends to never-existing nodes
+                    # and sends to exited nodes.
+                    if event.recipient in self._exited_nodes:
+                        continue
                     raise RuntimeError(f"Send to unknown address: {event}")
                 match event.payload:
                     case Message():
@@ -682,7 +694,12 @@ class EventLoop:
 
             finished = set[Addr]()
 
-            for addr, node in self.nodes.items():
+            # nodes without anything delivered can be skipped
+            nodes_to_run = set(
+                event.recipient for event in events if event.recipient in self.nodes
+            )
+            for addr in nodes_to_run:
+                node = self.nodes[addr]
                 proc_result = node.run(
                     self_addr=addr,
                     event_loop=self,
@@ -698,6 +715,7 @@ class EventLoop:
 
             for addr in finished:
                 del self.nodes[addr]
+                self._exited_nodes.add(addr)
 
             last_epoch = self.epoch
 
