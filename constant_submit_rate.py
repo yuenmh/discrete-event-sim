@@ -270,8 +270,14 @@ def experiment2(
             self.timeout_policy = timeout_policy
 
         async def start(self):
+            spawned_time = now()
             await self.semaphore.acquire()
             start_time = now()
+            # remove stale submissions.
+            # NOTE: this kind of defeats the purpose of the semaphore, so maybe
+            # this should be done differently.
+            if start_time - 10 > spawned_time:
+                return
             num_retries = 0
             # TODO: should this be before or after acquiring the semaphore?
             log(CLIENT_SUBMIT)
