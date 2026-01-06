@@ -1,4 +1,7 @@
 import concurrent.futures
+from collections import deque
+from collections.abc import Callable
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 import matplotlib.pyplot as plt
@@ -11,33 +14,35 @@ from des.sim import (
     EventLoop,
     Ref,
     RunResult,
+    StateMachineBase,
     Timeout,
-    ask,
+    handle,
     launch,
     log,
     now,
     rng,
-    self,
     send,
     sleep,
     spawn,
     spawn_interface,
+    this,
+    wait,
     wait_timeout,
 )
-from des.stdlib import LaunchedStateMachine, Queue, Semaphore
+from des.stdlib import LaunchedStateMachine, Semaphore
 
 if TYPE_CHECKING:
     from matplotlib.axes import Axes
 
 
-def constant_retry(wait_time: int):
+def constant_rate(wait_time: int):
     def policy(_try_num: int) -> int:
         return wait_time
 
     return policy
 
 
-def linear_backoff_retry(base_wait_time: int, per_try: int):
+def linear_backoff(base_wait_time: int, per_try: int):
     def policy(try_num: int) -> int:
         return base_wait_time + (per_try * try_num)
 
@@ -54,6 +59,14 @@ def smooth_series(series: pl.Series, avg_window: int) -> pl.Series:
     )
 
 
+TASK_DONE = "task done"
+WORKER_COMPLETED = "work_completed"
+QUEUE_SIZE = "queue size"
+CLIENT_SUBMIT = "client submit"
+CLIENT_RETRY = "client retry"
+TASK_FAILED = "task failed"
+
+
 def analyze_data(result: RunResult):
     max_epoch_s = max(e.epoch for e in result.logs) // 1000 + 1
 
@@ -64,7 +77,7 @@ def analyze_data(result: RunResult):
             [
                 (entry.data["start"] // 1000,)
                 for entry in result.logs
-                if entry.msg == "done" and entry.addr.name.startswith("client")
+                if entry.msg == TASK_DONE
             ],
             schema=["epoch"],
             orient="row",
@@ -91,7 +104,7 @@ def analyze_data(result: RunResult):
             [
                 (entry.epoch // 1000, entry.data["size"])
                 for entry in result.logs
-                if entry.msg == "queue size"
+                if entry.msg == QUEUE_SIZE
             ],
             schema=["epoch", "size"],
             orient="row",
@@ -108,7 +121,7 @@ def analyze_data(result: RunResult):
             [
                 (entry.epoch // 3000)
                 for entry in result.logs
-                if entry.addr.name.startswith("client") and entry.msg == "submit"
+                if entry.msg == CLIENT_SUBMIT
             ],
             schema=["epoch"],
             orient="row",
@@ -123,7 +136,11 @@ def analyze_data(result: RunResult):
 
     retries = (
         pl.DataFrame(
-            [(entry.epoch // 3000) for entry in result.logs if entry.msg == "retry"],
+            [
+                (entry.epoch // 3000)
+                for entry in result.logs
+                if entry.msg == CLIENT_RETRY
+            ],
             schema=["epoch"],
             orient="row",
         )
@@ -148,7 +165,7 @@ def analyze_data(result: RunResult):
                     entry.data["compute_time"],
                 )
                 for entry in result.logs
-                if entry.msg == "work_completed"
+                if entry.msg == WORKER_COMPLETED
             ],
             schema=["epoch", "compute_time"],
             orient="row",
@@ -169,111 +186,153 @@ def analyze_data(result: RunResult):
     }
 
 
+class Queue[T](StateMachineBase):
+    def __init__(self, capacity: int, log_event: str = "queue size"):
+        self._capacity = capacity
+        self._items = deque[T]()
+        self._waiters: deque[tuple[Addr, Ref]] = deque()
+        self._log_event = log_event
+
+    def _log_size(self):
+        log(self._log_event, size=len(self._items))
+
+    @handle()
+    async def try_enqueue(self, item: T, result: tuple[Addr, Ref] | None = None):
+        """Attempt to enqueue an item.
+        If result is provided, it sends `True` if it was enqueued, `False` if full.
+        """
+        if len(self._items) >= self._capacity:
+            if result is not None:
+                send(*result, False)
+        else:
+            self._items.append(item)
+            while self._waiters and self._items:
+                send(*self._waiters.popleft(), self._items.popleft())
+            self._log_size()
+            if result is not None:
+                send(*result, True)
+
+    @handle()
+    async def _dequeue(self, sender: Addr, ref: Ref):
+        if self._items:
+            send(sender, ref, self._items.popleft())
+            self._log_size()
+        else:
+            self._waiters.append((sender, ref))
+
+    async def dequeue(self, timeout: int | None = None) -> T:
+        """Dequeue an item, waiting up to timeout if specified.
+        If timeout is provided, and no item is available within the timeout,
+        raises `des.sim.Timeout`.
+        """
+        self._dequeue(this(), ref := Ref())
+        if timeout is None:
+            result, *_ = await wait(ref)
+        else:
+            result, *_ = await wait_timeout(timeout, ref)
+        return result
+
+
 def experiment2(
     work_time: int = 1000,
     work_time_rand: int = 200,
     timeout: int = 1900,
-    retry_delay: int = 100,
     inter_sleep: int = 4000,
     trigger_delay: int = 1_000_000,
     shared_seed: int = 0,
     local_seed: int = 100,
 ):
-    this = self
+    class Worker(LaunchedStateMachine):
+        def __init__(self, queue: Queue[tuple[Addr, WorkItem]]):
+            self._queue = queue
 
-    queue_addr = Addr("queue")
-    queue = Queue[tuple[Addr, Ref]](queue_addr)
-
-    class Worker:
-        def __init__(self, addr: Addr):
-            self.queue_addr = addr
-
-        async def submit(self, ref: Ref, timeout: int) -> bool:
-            log("submit", ref=ref)
-            if await ask(self.queue_addr, Queue.Enqueue, (this(), ref)) is Queue.Full:
-                log("fail", ref=ref, reason="full")
-                return False
-            try:
-                await wait_timeout(timeout, ref)
-            except Timeout:
-                log("fail", ref=ref, reason="timeout")
-                return False
-            return True
-
-    worker = Worker(queue_addr)
-
-    def create_worker():
-        @launch
-        async def worker_process():
+        async def start(self):
             while True:
-                addr, ref = await queue.dequeue()
+                addr, ref = await self._queue.dequeue()
                 compute_time = (
                     work_time
                     - work_time_rand
                     + int(rng().expovariate(1 / work_time_rand))
                 )
                 await sleep(compute_time)
-                log("work_completed", ref=ref, compute_time=compute_time)
+                log(WORKER_COMPLETED, ref=ref, compute_time=compute_time)
                 send(addr, ref, hint="done")
 
-        return worker_process
-
     class BackgroundSubmit(LaunchedStateMachine):
-        def __init__(self, worker: Worker, ref: Ref, semaphore: Semaphore):
-            self.worker = worker
-            self.ref = ref
+        def __init__(
+            self,
+            worker_queue: Queue[tuple[Addr, WorkItem]],
+            semaphore: Semaphore,
+            timeout_policy: Callable[[int], int],
+        ):
+            self.worker_queue = worker_queue
             self.semaphore = semaphore
+            self.timeout_policy = timeout_policy
 
         async def start(self):
             await self.semaphore.acquire()
             start_time = now()
-            retries = 0
-            while not await worker.submit(self.ref, timeout=timeout):
-                retries += 1
-                if retries >= 6:
-                    log("abandon", ref=self.ref, retries=retries)
-                    break
-                log("retry", ref=self.ref, retries=retries)
-                await sleep(retry_delay)
-            self.semaphore.release()
-            log(
-                "done",
-                ref=self.ref,
-                retries=retries,
-                start=start_time,
-                duration=now() - start_time,
-            )
-
-    def create_client():
-        @launch
-        async def client():
-            semaphore = spawn_interface(Semaphore(max_count=4), name="semaphore")
-
+            num_retries = 0
+            # TODO: should this be before or after acquiring the semaphore?
+            log(CLIENT_SUBMIT)
             while True:
-                ref = Ref()
-                spawn(
-                    BackgroundSubmit(worker=worker, ref=ref, semaphore=semaphore),
-                    name="submit",
-                )
-                print("spawned", now())
-                await sleep(timeout + inter_sleep)
+                item = WorkItem(Ref())
+                self.worker_queue.try_enqueue((this(), item))
+                try:
+                    await wait_timeout(self.timeout_policy(num_retries), item)
+                    log(
+                        TASK_DONE,
+                        retries=num_retries,
+                        start=start_time,
+                        duration=now() - start_time,
+                    )
+                    break
+                except Timeout:
+                    num_retries += 1
+                if num_retries >= 6:
+                    log(TASK_FAILED)
+                    break
+            self.semaphore.release()
 
-        return client
+    @dataclass
+    class WorkItem:
+        """Newtype of `Ref` to make it clear that this does not represent a simple response channel."""
 
-    def create_trigger():
-        @launch
-        async def trigger():
+        id: Ref
+
+    class Trigger(LaunchedStateMachine):
+        def __init__(self, worker_queue: Queue[tuple[Addr, WorkItem]]):
+            self.worker_queue = worker_queue
+
+        async def start(self):
             await sleep(trigger_delay)
             for _ in range(20):
-                await worker.submit(Ref(), timeout=50)
+                self.worker_queue.try_enqueue((this(), WorkItem(Ref())))
+                await sleep(50)
 
-        return trigger
+    @launch
+    async def main():
+        worker_queue = spawn_interface(
+            Queue[tuple[Addr, WorkItem]](capacity=20, log_event=QUEUE_SIZE),
+            name="worker_queue",
+        )
+        spawn(Worker(queue=worker_queue), name="worker")
+        semaphore = spawn_interface(Semaphore(max_count=4), name="semaphore")
+        spawn(Trigger(worker_queue=worker_queue), name="trigger")
+
+        while True:
+            spawn(
+                BackgroundSubmit(
+                    worker_queue=worker_queue,
+                    semaphore=semaphore,
+                    timeout_policy=constant_rate(timeout),
+                ),
+                name="submit",
+            )
+            await sleep(timeout + inter_sleep)
 
     el = EventLoop(seed=shared_seed)
-    el.spawn(queue_addr, lambda: Queue.create(max_size=20))
-    el.spawn(Addr("worker"), create_worker)
-    el.spawn(Addr("client"), create_client)
-    el.spawn(Addr("trigger"), create_trigger)
+    el.spawn(Addr("main"), main)
     reseed_time = trigger_delay + 100_000
     el.run(reseed_time)
 
