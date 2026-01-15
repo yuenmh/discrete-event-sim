@@ -486,6 +486,7 @@ class Process:
     ):
         self._sm = init.sm
         self._inbox: list[Message] = []
+        self._last_checked = 0
         self._drop_hints: list[Matcher] = []
         self._stopped = False
         self._detector = _LeakDetector(alpha=0.09, threshold=0.1)
@@ -507,16 +508,22 @@ class Process:
         num_iters = 0
         while True:
             try:
-                result = next_state(self._sm, ctx=ctx, msgs=self._inbox)
+                # already checked messages can be skipped
+                result = next_state(
+                    self._sm, ctx=ctx, msgs=self._inbox[self._last_checked :]
+                )
             except StopStateMachine:
                 self._stopped = True
                 break
             if result is not None:
                 i, next_sm = result
                 self._sm = next_sm
-                _ = self._inbox.pop(i)
+                _ = self._inbox.pop(self._last_checked + i)
+                self._last_checked = 0
                 num_iters += 1
             else:
+                # no matching message, therefore all were checked
+                self._last_checked = len(self._inbox)
                 break
         self._analyze_inbox_growth(self_addr)
         return ProcessRunResult(
