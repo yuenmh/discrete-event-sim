@@ -1,4 +1,4 @@
-import concurrent.futures
+import functools
 from collections import deque
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -29,7 +29,7 @@ from des.sim import (
     wait,
     wait_timeout,
 )
-from des.stdlib import LaunchedStateMachine, Semaphore
+from des.stdlib import LaunchedStateMachine
 
 if TYPE_CHECKING:
     from matplotlib.axes import Axes
@@ -262,22 +262,13 @@ def experiment2(
         def __init__(
             self,
             worker_queue: Queue[tuple[Addr, WorkItem]],
-            semaphore: Semaphore,
             timeout_policy: Callable[[int], int],
         ):
             self.worker_queue = worker_queue
-            self.semaphore = semaphore
             self.timeout_policy = timeout_policy
 
         async def start(self):
-            spawned_time = now()
-            await self.semaphore.acquire()
             start_time = now()
-            # remove stale submissions.
-            # NOTE: this kind of defeats the purpose of the semaphore, so maybe
-            # this should be done differently.
-            if start_time - 10 > spawned_time:
-                return
             num_retries = 0
             # TODO: should this be before or after acquiring the semaphore?
             log(CLIENT_SUBMIT)
@@ -298,7 +289,6 @@ def experiment2(
                 if num_retries >= 6:
                     log(TASK_FAILED)
                     break
-            self.semaphore.release()
 
     @dataclass
     class WorkItem:
@@ -323,14 +313,12 @@ def experiment2(
             name="worker_queue",
         )
         spawn(Worker(queue=worker_queue), name="worker")
-        semaphore = spawn_interface(Semaphore(max_count=4), name="semaphore")
         spawn(Trigger(worker_queue=worker_queue), name="trigger")
 
         while True:
             spawn(
                 BackgroundSubmit(
                     worker_queue=worker_queue,
-                    semaphore=semaphore,
                     timeout_policy=constant_rate(timeout),
                 ),
                 name="submit",
@@ -406,17 +394,13 @@ def plot_single_run_metrics(metrics: dict[str, pl.DataFrame]):
 
 def metastable_comparison_plot():
     num_trials = 1
-    with concurrent.futures.ProcessPoolExecutor() as executor:
-        futures = [
-            executor.submit(
-                experiment2, timeout=1910, shared_seed=0, local_seed=local_seed
-            )
-            for local_seed in range(num_trials)
-        ]
-        results = [
-            fut.result()
-            for fut in tqdm(concurrent.futures.as_completed(futures), total=num_trials)
-        ]
+    trials = [
+        functools.partial(
+            experiment2, timeout=1910, shared_seed=0, local_seed=local_seed
+        )
+        for local_seed in range(num_trials)
+    ]
+    results = [trial() for trial in tqdm(trials, total=num_trials)]
     results.sort(key=lambda x: x[1]["local_seed"])
 
     def plot_metrics(
